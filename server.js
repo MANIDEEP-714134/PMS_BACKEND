@@ -1,25 +1,37 @@
 /**
  * Node.js Server for MQTT Data Handling & Firestore Storage
- * Features:
- *  - MQTT subscriber (saves sensor data to Firestore)
- *  - GET latest data (returns "--" if older than 1 min)
- *  - POST relay/control data to Firestore
+ * Uses environment variables for sensitive config
  */
 
+require("dotenv").config(); // Load .env variables
 const express = require("express");
 const mqtt = require("mqtt");
 const admin = require("firebase-admin");
 const cors = require("cors");
 
-// ===== CONFIG =====
-const MQTT_BROKER_URL = "mqtt://broker.emqx.io:1883";
-const MQTT_TOPIC = "PMS/data";
+// ===== CONFIG FROM ENV =====
+const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL;
+const MQTT_TOPIC = process.env.MQTT_TOPIC;
 const PORT = process.env.PORT || 5000;
 
 // ===== FIREBASE SETUP =====
+const serviceAccount = {
+  type: process.env.FIREBASE_TYPE,
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  client_id: process.env.FIREBASE_CLIENT_ID,
+  auth_uri: process.env.FIREBASE_AUTH_URI,
+  token_uri: process.env.FIREBASE_TOKEN_URI,
+  auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
+  client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
+};
+
 admin.initializeApp({
-  credential: admin.credential.cert(require("./serviceAccountKey.json")),
+  credential: admin.credential.cert(serviceAccount),
 });
+
 const firestore = admin.firestore();
 
 // ===== EXPRESS SETUP =====
@@ -32,10 +44,6 @@ let latestData = {};
 let lastUpdateTime = null;
 
 // ===== HELPER FUNCTIONS =====
-
-/**
- * Returns a human-readable timestamp: YYYY-MM-DD_HH-mm-ss
- */
 const getFormattedTimestamp = () => {
   const now = new Date();
   const pad = (n) => (n < 10 ? "0" + n : n);
@@ -44,9 +52,6 @@ const getFormattedTimestamp = () => {
   )}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 };
 
-/**
- * Logs with timestamp
- */
 const log = (msg, type = "INFO") => {
   console.log(`[${new Date().toISOString()}] [${type}] ${msg}`);
 };
@@ -64,7 +69,7 @@ client.on("connect", () => {
 
 client.on("message", async (topic, message, packet) => {
   try {
-    if (packet.retain) return; // ignore retained messages
+    if (packet.retain) return;
 
     const data = JSON.parse(message.toString());
     if (!data.device_id) {
@@ -79,7 +84,6 @@ client.on("message", async (topic, message, packet) => {
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Update memory store for GET requests
     latestData = { ...data, timestamp: new Date().toISOString() };
     lastUpdateTime = Date.now();
 
@@ -91,13 +95,8 @@ client.on("message", async (topic, message, packet) => {
 
 // ===== ROUTES =====
 
-/**
- * GET latest MQTT data
- * Returns '--' if last update is older than 1 minute
- */
 app.get("/api/data/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
-
   if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
 
   try {
@@ -107,30 +106,21 @@ app.get("/api/data/:deviceId", async (req, res) => {
       .limit(1)
       .get();
 
-    if (snapshot.empty) {
-      return res.json({ status: "no_data", data: "--" });
-    }
+    if (snapshot.empty) return res.json({ status: "no_data", data: "--" });
 
     const latestDoc = snapshot.docs[0].data();
-    const docTime = latestDoc.timestamp.toDate(); // Firestore Timestamp → JS Date
+    const docTime = latestDoc.timestamp.toDate();
     const diffSeconds = (Date.now() - docTime.getTime()) / 1000;
 
-    if (diffSeconds > 60) {
-      return res.json({ status: "no_data", data: "--" });
-    }
+    if (diffSeconds > 60) return res.json({ status: "no_data", data: "--" });
 
     res.json({ status: "ok", data: latestDoc });
   } catch (err) {
-    console.error(`Error fetching data for ${deviceId}:`, err);
+    log(`Error fetching data for ${deviceId}: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
   }
 });
 
-
-/**
- * POST relay/control data
- * Body: { device_id, relay1, relay2, relay3, relay4 }
- */
 app.post("/api/relays", async (req, res) => {
   try {
     const { device_id, ...relays } = req.body;
