@@ -1,6 +1,6 @@
 /**
  * Node.js Server for MQTT Data Handling & Firestore Storage
- * Uses environment variables for sensitive config
+ * Uses Base64 encoded service account JSON from environment variable
  */
 
 require("dotenv").config(); // Load .env variables
@@ -14,8 +14,15 @@ const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL;
 const MQTT_TOPIC = process.env.MQTT_TOPIC;
 const PORT = process.env.PORT || 5000;
 
-// ===== FIREBASE SETUP =====
-const serviceAccount = require("./serviceAccount.json");
+// ===== FIREBASE SETUP (using Base64 from .env) =====
+if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT_BASE64 in .env");
+  process.exit(1);
+}
+
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
+);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -83,7 +90,6 @@ client.on("message", async (topic, message, packet) => {
 });
 
 // ===== ROUTES =====
-
 app.get("/api/data/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
   if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
