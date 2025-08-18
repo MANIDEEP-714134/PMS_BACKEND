@@ -135,7 +135,7 @@ app.get("/api/data/:deviceId", async (req, res) => {
     const docTime = latestDoc.timestamp.toDate();
     const diffSeconds = (Date.now() - docTime.getTime()) / 1000;
 
-    if (diffSeconds > 60) return res.json({ status: "no_data", data: "--" });
+
 
     res.json({ status: "ok", data: latestDoc });
   } catch (err) {
