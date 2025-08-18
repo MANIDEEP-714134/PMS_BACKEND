@@ -89,6 +89,34 @@ client.on("message", async (topic, message, packet) => {
   }
 });
 
+app.post("/api/data", async (req, res) => {
+  try {
+    const data = req.body;
+
+    if (!data.device_id) {
+      return res.status(400).json({ status: "error", error: "device_id required" });
+    }
+
+    const docId = getFormattedTimestamp();
+
+    await firestore.collection(data.device_id).doc(docId).set({
+      ...data,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    latestData = { ...data, timestamp: new Date().toISOString() };
+    lastUpdateTime = Date.now();
+
+    log(`HTTP Data stored: ${data.device_id}/${docId}`);
+
+    res.json({ status: "success", stored: data });
+  } catch (err) {
+    log(`Error saving HTTP data: ${err}`, "ERROR");
+    res.status(500).json({ status: "error", error: err.message });
+  }
+});
+
+
 // ===== ROUTES =====
 app.get("/api/data/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
