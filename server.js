@@ -1,28 +1,23 @@
 /**
- * Node.js Server for MQTT Data Handling & Firestore Storage
+ * Node.js Server for Firestore Storage (no MQTT)
  * Uses Base64 encoded service account JSON from environment variable
  */
 
 require("dotenv").config(); // Load .env variables
 const express = require("express");
-const mqtt = require("mqtt");
 const admin = require("firebase-admin");
 const cors = require("cors");
 
-// ===== CONFIG FROM ENV =====
-const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL;
-const MQTT_TOPIC = process.env.MQTT_TOPIC;
-const PORT = process.env.PORT || 5000;
+// ===== CONFIG =====
+const PORT = 8080;
 
 // ===== FIREBASE SETUP (using Base64 from .env) =====
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
   console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT_BASE64 in .env");
   process.exit(1);
 }
+const serviceAccount = require("./serviceAccountKey.json");
 
-const serviceAccount = JSON.parse(
-  Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
-);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -35,11 +30,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== MEMORY STORE FOR LATEST DATA =====
-let latestData = {};
-let lastUpdateTime = null;
-
-// ===== HELPER FUNCTIONS =====
+// ===== HELPERS =====
 const getFormattedTimestamp = () => {
   const now = new Date();
   const pad = (n) => (n < 10 ? "0" + n : n);
@@ -52,43 +43,9 @@ const log = (msg, type = "INFO") => {
   console.log(`[${new Date().toISOString()}] [${type}] ${msg}`);
 };
 
-// ===== MQTT SETUP =====
-const client = mqtt.connect(MQTT_BROKER_URL);
+// ===== API ROUTES =====
 
-client.on("connect", () => {
-  log(`Connected to MQTT broker: ${MQTT_BROKER_URL}`);
-  client.subscribe(MQTT_TOPIC, (err) => {
-    if (!err) log(`Subscribed to topic: ${MQTT_TOPIC}`);
-    else log(`Subscribe error: ${err}`, "ERROR");
-  });
-});
-
-client.on("message", async (topic, message, packet) => {
-  try {
-    if (packet.retain) return;
-
-    const data = JSON.parse(message.toString());
-    if (!data.device_id) {
-      log("No device_id in MQTT message, skipping...", "WARN");
-      return;
-    }
-
-    const docId = getFormattedTimestamp();
-
-    await firestore.collection(data.device_id).doc(docId).set({
-      ...data,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    latestData = { ...data, timestamp: new Date().toISOString() };
-    lastUpdateTime = Date.now();
-
-    log(`Data stored: ${data.device_id}/${docId}`);
-  } catch (err) {
-    log(`Error processing MQTT message: ${err}`, "ERROR");
-  }
-});
-
+// Store incoming data
 app.post("/api/data", async (req, res) => {
   try {
     const data = req.body;
@@ -104,9 +61,6 @@ app.post("/api/data", async (req, res) => {
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    latestData = { ...data, timestamp: new Date().toISOString() };
-    lastUpdateTime = Date.now();
-
     log(`HTTP Data stored: ${data.device_id}/${docId}`);
 
     res.json({ status: "success", stored: data });
@@ -116,8 +70,7 @@ app.post("/api/data", async (req, res) => {
   }
 });
 
-
-// ===== ROUTES =====
+// Fetch latest data for a device
 app.get("/api/data/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
   if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
@@ -132,11 +85,6 @@ app.get("/api/data/:deviceId", async (req, res) => {
     if (snapshot.empty) return res.json({ status: "no_data", data: "--" });
 
     const latestDoc = snapshot.docs[0].data();
-    const docTime = latestDoc.timestamp.toDate();
-    const diffSeconds = (Date.now() - docTime.getTime()) / 1000;
-
-
-
     res.json({ status: "ok", data: latestDoc });
   } catch (err) {
     log(`Error fetching data for ${deviceId}: ${err}`, "ERROR");
@@ -144,6 +92,7 @@ app.get("/api/data/:deviceId", async (req, res) => {
   }
 });
 
+// Save relay control data
 app.post("/api/relays", async (req, res) => {
   try {
     const { device_id, ...relays } = req.body;
