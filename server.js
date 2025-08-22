@@ -16,7 +16,7 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
   console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT_BASE64 in .env");
   process.exit(1);
 }
-const serviceAccount = require("./serviceAccountKey.json");
+const serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8"));
 
 
 admin.initializeApp({
@@ -43,9 +43,61 @@ const log = (msg, type = "INFO") => {
   console.log(`[${new Date().toISOString()}] [${type}] ${msg}`);
 };
 
+const liveDataCache = {};
+
+const formatData = (device_id, payload, firestoreTimestamp) => {
+  return {
+    device_id: device_id,
+    line1: payload.line1 ?? 0,
+    line2: payload.line2 ?? 0,
+    temperature: payload.temperature ?? 0,
+    turbidity: payload.turbidity ?? 0,
+    ph: payload.ph ?? 0,
+    do: payload.do ?? 0,
+    tds: payload.tds ?? 0,
+    relay1_status: payload.relay1_status ?? 0,
+    relay2_status: payload.relay2_status ?? 0,
+    timestamp: firestoreTimestamp || admin.firestore.Timestamp.now(),
+  };
+};
+
 // ===== API ROUTES =====
 
 // Store incoming data
+// Fetch history data for the last 2 days
+app.get("/api/history/:deviceId", async (req, res) => {
+  const { deviceId } = req.params;
+  if (!deviceId)
+    return res.status(400).json({ status: "error", error: "deviceId required" });
+
+  try {
+    // Calculate 2 days ago
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+
+    // Query Firestore
+    const snapshot = await firestore
+      .collection(deviceId)
+      .where("timestamp", ">=", twoDaysAgo)
+      .orderBy("timestamp", "desc")
+      .get();
+
+    if (snapshot.empty) {
+      return res.json({ status: "no_data", data: [] });
+    }
+
+    const history = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({ status: "ok", data: history });
+  } catch (err) {
+    log(`Error fetching history for ${deviceId}: ${err}`, "ERROR");
+    res.status(500).json({ status: "error", error: err.message });
+  }
+});
+
+
 app.post("/api/data", async (req, res) => {
   try {
     const data = req.body;
@@ -56,14 +108,21 @@ app.post("/api/data", async (req, res) => {
 
     const docId = getFormattedTimestamp();
 
-    await firestore.collection(data.device_id).doc(docId).set({
-      ...data,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // Create formatted structure
+    const formatted = formatData(data.device_id, data);
+
+    // Save in Firestore (for history)
+    await firestore.collection(data.device_id).doc(docId).set(formatted);
+
+    // Save in memory cache
+    liveDataCache[data.device_id] = {
+      data: formatted,
+      lastUpdated: Date.now(),
+    };
 
     log(`HTTP Data stored: ${data.device_id}/${docId}`);
 
-    res.json({ status: "success", stored: data });
+    res.json({ status: "success", stored: formatted });
   } catch (err) {
     log(`Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
@@ -71,25 +130,19 @@ app.post("/api/data", async (req, res) => {
 });
 
 // Fetch latest data for a device
-app.get("/api/data/:deviceId", async (req, res) => {
+app.get("/api/data/:deviceId", (req, res) => {
   const { deviceId } = req.params;
-  if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
+  if (!deviceId)
+    return res.status(400).json({ status: "error", error: "deviceId required" });
 
-  try {
-    const snapshot = await firestore
-      .collection(deviceId)
-      .orderBy("timestamp", "desc")
-      .limit(1)
-      .get();
+  const cacheEntry = liveDataCache[deviceId];
 
-    if (snapshot.empty) return res.json({ status: "no_data", data: "--" });
-
-    const latestDoc = snapshot.docs[0].data();
-    res.json({ status: "ok", data: latestDoc });
-  } catch (err) {
-    log(`Error fetching data for ${deviceId}: ${err}`, "ERROR");
-    res.status(500).json({ status: "error", error: err.message });
+  // If no data or older than 30s → return no_data
+  if (!cacheEntry || Date.now() - cacheEntry.lastUpdated > 30000) {
+    return res.json({ status: "no_data", data: "--" });
   }
+
+  res.json({ status: "ok", data: cacheEntry.data });
 });
 
 // Save relay control data
