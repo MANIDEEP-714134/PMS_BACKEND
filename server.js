@@ -11,6 +11,7 @@ const cors = require("cors");
 // ===== CONFIG =====
 const PORT = 8080;
 const TWO_DAYS = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
+const LINE2_THRESHOLD = 100; // example threshold
 
 // ===== FIREBASE SETUP (using Base64 from .env) =====
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
@@ -78,7 +79,7 @@ app.post("/api/data", async (req, res) => {
     const docId = getFormattedTimestamp();
     const formatted = formatData(data.device_id, data);
 
-    // === (Optional) Save in Firestore for long-term history ===
+    // === Save in Firestore for long-term history ===
     await firestore.collection(data.device_id).doc(docId).set(formatted);
 
     // === Save in live data cache ===
@@ -99,6 +100,53 @@ app.post("/api/data", async (req, res) => {
     );
 
     log(`HTTP Data stored: ${data.device_id}/${docId}`);
+
+    // === 🚨 AUTO NOTIFICATION CHECK ===
+        // === 🚨 AUTO NOTIFICATION CHECK ===
+    if (formatted.line2 < LINE2_THRESHOLD || formatted.line1 < LINE2_THRESHOLD) {
+      try {
+        const snapshot = await firestore
+          .collection("users")
+          .where("deviceId", "==", data.device_id)
+          .get();
+
+        if (!snapshot.empty) {
+          snapshot.forEach(async (doc) => {
+            const userData = doc.data();
+            const token = userData.fcmToken;
+
+            if (token) {
+              let alertMsg = "";
+              if (formatted.line1 < LINE2_THRESHOLD) {
+                alertMsg += `line1 = ${formatted.line1} `;
+              }
+              if (formatted.line2 < LINE2_THRESHOLD) {
+                alertMsg += `line2 = ${formatted.line2}`;
+              }
+
+              const message = {
+                notification: {
+                  title: "⚠️ Alert!",
+                  body: `Device ${data.device_id} exceeded: ${alertMsg}`,
+                },
+                token,
+              };
+
+              await admin.messaging().send(message);
+              log(`Notification sent to ${userData.name} (${doc.id}) for ${data.device_id}`);
+            } else {
+              log(`No fcmToken for user ${doc.id}`, "WARN");
+            }
+          });
+        } else {
+          log(`No user found with deviceId=${data.device_id}`, "WARN");
+        }
+      } catch (err) {
+        log(`Notification error: ${err}`, "ERROR");
+      }
+    }
+
+
     res.json({ status: "success", stored: formatted });
   } catch (err) {
     log(`Error saving HTTP data: ${err}`, "ERROR");
