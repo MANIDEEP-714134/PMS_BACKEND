@@ -11,7 +11,6 @@ const cors = require("cors");
 // ===== CONFIG =====
 const PORT = 8080;
 const TWO_DAYS = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
-const LINE2_THRESHOLD = 100; // example threshold
 
 // ===== FIREBASE SETUP (using Base64 from .env) =====
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
@@ -63,8 +62,8 @@ const formatData = (device_id, payload, firestoreTimestamp) => {
 };
 
 // ===== IN-MEMORY CACHES =====
-const liveDataCache = {};   // latest data only { deviceId: { data, lastUpdated } }
-const historyCache = {};    // per device: array of last 2 days
+const liveDataCache = {}; // latest data only { deviceId: { data, lastUpdated } }
+const historyCache = {}; // per device: array of last 2 days
 
 // ===== API ROUTES =====
 
@@ -102,50 +101,72 @@ app.post("/api/data", async (req, res) => {
     log(`HTTP Data stored: ${data.device_id}/${docId}`);
 
     // === 🚨 AUTO NOTIFICATION CHECK ===
-        // === 🚨 AUTO NOTIFICATION CHECK ===
-    if (formatted.line2 < LINE2_THRESHOLD || formatted.line1 < LINE2_THRESHOLD) {
-      try {
-        const snapshot = await firestore
-          .collection("users")
-          .where("deviceId", "==", data.device_id)
-          .get();
+    try {
+      const snapshot = await firestore
+        .collection("users")
+        .where("deviceId", "==", data.device_id)
+        .get();
 
-        if (!snapshot.empty) {
-          snapshot.forEach(async (doc) => {
-            const userData = doc.data();
-            const token = userData.fcmToken;
+      if (!snapshot.empty) {
+        snapshot.forEach(async (doc) => {
+          const userData = doc.data();
+          const token = userData.fcmToken;
 
-            if (token) {
-              let alertMsg = "";
-              if (formatted.line1 < LINE2_THRESHOLD) {
-                alertMsg += `line1 = ${formatted.line1} `;
-              }
-              if (formatted.line2 < LINE2_THRESHOLD) {
-                alertMsg += `line2 = ${formatted.line2}`;
-              }
+          if (token) {
+            let alertMsg = "";
 
+            // --- Line1 check ---
+            const perAerator1 = userData.perAerator_currentLine1 || 1; // avoid div by 0
+            const noAerators1 = userData.noAeratorsLine1 || 0;
+            const ratio1 = Math.round(formatted.line1 / perAerator1);
+
+            if (ratio1 < noAerators1) {
+              alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${noAerators1}. `;
+            }
+
+            // --- Line2 check ---
+            const perAerator2 = userData.perAerator_currentLine2 || 1;
+            const noAerators2 = userData.noAeratorsLine2 || 0;
+            const ratio2 = Math.round(formatted.line2 / perAerator2);
+
+            if (ratio2 < noAerators2) {
+              alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${noAerators2}.`;
+            }
+
+            // --- Send notification if any issue found ---
+            if (alertMsg) {
               const message = {
                 notification: {
-                  title: "⚠️ Alert!",
-                  body: `Device ${data.device_id} exceeded: ${alertMsg}`,
+                  title: "⚠️ Aerator Alert!",
+                  body: `Device ${data.device_id}: ${alertMsg}`,
                 },
                 token,
               };
 
-              await admin.messaging().send(message);
-              log(`Notification sent to ${userData.name} (${doc.id}) for ${data.device_id}`);
+              try {
+                await admin.messaging().send(message);
+                log(`Notification sent to ${userData.name || "Unknown"} (${doc.id})`);
+              } catch (err) {
+                if (err.code === "messaging/registration-token-not-registered") {
+                  log(`Invalid/expired fcmToken for user ${doc.id}`, "WARN");
+                } else {
+                  log(`Failed to send notification to ${doc.id}: ${err.message}`, "ERROR");
+                }
+                // ✅ continue without crashing
+              }
             } else {
-              log(`No fcmToken for user ${doc.id}`, "WARN");
+              log(`No alert needed for ${doc.id} (device ${data.device_id})`);
             }
-          });
-        } else {
-          log(`No user found with deviceId=${data.device_id}`, "WARN");
-        }
-      } catch (err) {
-        log(`Notification error: ${err}`, "ERROR");
+          } else {
+            log(`No fcmToken for user ${doc.id}`, "WARN");
+          }
+        });
+      } else {
+        log(`No user found with deviceId=${data.device_id}`, "WARN");
       }
+    } catch (err) {
+      log(`Notification error: ${err}`, "ERROR");
     }
-
 
     res.json({ status: "success", stored: formatted });
   } catch (err) {
