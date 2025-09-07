@@ -64,6 +64,7 @@ const formatData = (device_id, payload, firestoreTimestamp) => {
 // ===== IN-MEMORY CACHES =====
 const liveDataCache = {}; // latest data only { deviceId: { data, lastUpdated } }
 const historyCache = {}; // per device: array of last 2 days
+const userSettingsCache = {}; // { deviceId: { noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2, updatedAt } }
 
 // ===== API ROUTES =====
 
@@ -102,45 +103,53 @@ app.post("/api/data", async (req, res) => {
 
     // === 🚨 AUTO NOTIFICATION CHECK ===
     try {
-      const snapshot = await firestore
-        .collection("users")
-        .where("deviceId", "==", data.device_id)
-        .get();
+      let settings = userSettingsCache[data.device_id];
 
-      if (!snapshot.empty) {
-        snapshot.forEach(async (doc) => {
-          const userData = doc.data();
-          const token = userData.fcmToken;
+      // Cold start → load from Firestore once
+      if (!settings) {
+        const snapshot = await firestore
+          .collection("users")
+          .where("deviceId", "==", data.device_id)
+          .get();
+        if (!snapshot.empty) {
+          settings = snapshot.docs[0].data();
+          userSettingsCache[data.device_id] = settings;
+          log(`Cached user settings for deviceId=${data.device_id}`);
+        }
+      }
 
-          if (token) {
-            let alertMsg = "";
+      if (settings) {
+        const perAerator1 = settings.perAerator_currentLine1 || 1;
+        const noAerators1 = settings.noAeratorsLine1 || 0;
+        const ratio1 = Math.round(formatted.line1 / perAerator1);
 
-            // --- Line1 check ---
-            const perAerator1 = userData.perAerator_currentLine1 || 1; // avoid div by 0
-            const noAerators1 = userData.noAeratorsLine1 || 0;
-            const ratio1 = Math.round(formatted.line1 / perAerator1);
+        const perAerator2 = settings.perAerator_currentLine2 || 1;
+        const noAerators2 = settings.noAeratorsLine2 || 0;
+        const ratio2 = Math.round(formatted.line2 / perAerator2);
 
-            if (ratio1 < noAerators1) {
-              alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${noAerators1}. `;
-            }
+        let alertMsg = "";
+        if (ratio1 < noAerators1) {
+          alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${noAerators1}. `;
+        }
+        if (ratio2 < noAerators2) {
+          alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${noAerators2}.`;
+        }
 
-            // --- Line2 check ---
-            const perAerator2 = userData.perAerator_currentLine2 || 1;
-            const noAerators2 = userData.noAeratorsLine2 || 0;
-            const ratio2 = Math.round(formatted.line2 / perAerator2);
+        if (alertMsg) {
+          const snapshot = await firestore
+            .collection("users")
+            .where("deviceId", "==", data.device_id)
+            .get();
 
-            if (ratio2 < noAerators2) {
-              alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${noAerators2}.`;
-            }
-
-            // --- Send notification if any issue found ---
-            if (alertMsg) {
+          snapshot.forEach(async (doc) => {
+            const userData = doc.data();
+            if (userData.fcmToken) {
               const message = {
                 notification: {
                   title: "⚠️ Aerator Alert!",
                   body: `Device ${data.device_id}: ${alertMsg}`,
                 },
-                token,
+                token: userData.fcmToken,
               };
 
               try {
@@ -152,17 +161,16 @@ app.post("/api/data", async (req, res) => {
                 } else {
                   log(`Failed to send notification to ${doc.id}: ${err.message}`, "ERROR");
                 }
-                // ✅ continue without crashing
               }
             } else {
-              log(`No alert needed for ${doc.id} (device ${data.device_id})`);
+              log(`No fcmToken for user ${doc.id}`, "WARN");
             }
-          } else {
-            log(`No fcmToken for user ${doc.id}`, "WARN");
-          }
-        });
+          });
+        } else {
+          log(`No alert needed for device ${data.device_id}`);
+        }
       } else {
-        log(`No user found with deviceId=${data.device_id}`, "WARN");
+        log(`No settings found in cache/Firestore for deviceId=${data.device_id}`, "WARN");
       }
     } catch (err) {
       log(`Notification error: ${err}`, "ERROR");
@@ -172,6 +180,56 @@ app.post("/api/data", async (req, res) => {
   } catch (err) {
     log(`Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
+  }
+});
+
+// ===== PATCH USERS BY deviceId (from body) =====
+app.patch("/api/users/update", async (req, res) => {
+  try {
+    const { deviceId, noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2 } = req.body;
+
+    if (!deviceId) {
+      return res.status(400).json({ status: "error", error: "deviceId is required in body" });
+    }
+
+    // Collect only provided fields
+    const updates = {};
+    if (noAeratorsLine1 !== undefined) updates.noAeratorsLine1 = noAeratorsLine1;
+    if (noAeratorsLine2 !== undefined) updates.noAeratorsLine2 = noAeratorsLine2;
+    if (perAerator_currentLine1 !== undefined) updates.perAerator_currentLine1 = perAerator_currentLine1;
+    if (perAerator_currentLine2 !== undefined) updates.perAerator_currentLine2 = perAerator_currentLine2;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ status: "error", error: "At least one of the 4 fields must be provided" });
+    }
+
+    updates.updatedAt = new Date().toISOString();
+
+    // Query all users with given deviceId
+    const snapshot = await firestore.collection("users").where("deviceId", "==", deviceId).get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ status: "error", error: `No users found with deviceId=${deviceId}` });
+    }
+
+    // Batch update all matching docs
+    const batch = firestore.batch();
+    snapshot.forEach((doc) => {
+      batch.update(doc.ref, updates);
+    });
+    await batch.commit();
+
+    // Update cache
+    userSettingsCache[deviceId] = {
+      ...(userSettingsCache[deviceId] || {}),
+      ...updates,
+    };
+
+    res.json({ status: "success", message: `Updated ${snapshot.size} user(s) with deviceId ${deviceId}`, cache: userSettingsCache[deviceId] });
+    log(`Updated ${snapshot.size} user(s) with deviceId ${deviceId} (cache updated)`);
+  } catch (error) {
+    log(`Error patching users: ${error}`, "ERROR");
+    res.status(500).json({ status: "error", error: error.message });
   }
 });
 
