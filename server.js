@@ -1,7 +1,7 @@
 /**
  * Node.js Server for Firestore Storage + In-Memory Cache (optimized)
  * Stores last 2 days in server memory, full history optionally in Firestore
- * Only caches useful user settings, not all user data
+ * Sends notifications to all users with the same deviceId when condition is met
  */
 
 require("dotenv").config();
@@ -46,26 +46,24 @@ const log = (msg, type = "INFO") => {
   console.log(`[${new Date().toISOString()}] [${type}] ${msg}`);
 };
 
-const formatData = (device_id, payload, firestoreTimestamp) => {
-  return {
-    device_id: device_id,
-    line1: payload.line1 ?? 0,
-    line2: payload.line2 ?? 0,
-    temperature: payload.temperature ?? 0,
-    turbidity: payload.turbidity ?? 0,
-    ph: payload.ph ?? 0,
-    do: payload.do ?? 0,
-    tds: payload.tds ?? 0,
-    relay1_status: payload.relay1_status ?? 0,
-    relay2_status: payload.relay2_status ?? 0,
-    timestamp: firestoreTimestamp || admin.firestore.Timestamp.now(),
-  };
-};
+const formatData = (device_id, payload, firestoreTimestamp) => ({
+  device_id,
+  line1: payload.line1 ?? 0,
+  line2: payload.line2 ?? 0,
+  temperature: payload.temperature ?? 0,
+  turbidity: payload.turbidity ?? 0,
+  ph: payload.ph ?? 0,
+  do: payload.do ?? 0,
+  tds: payload.tds ?? 0,
+  relay1_status: payload.relay1_status ?? 0,
+  relay2_status: payload.relay2_status ?? 0,
+  timestamp: firestoreTimestamp || admin.firestore.Timestamp.now(),
+});
 
 // ===== IN-MEMORY CACHES =====
-const liveDataCache = {}; // latest data only { deviceId: { data, lastUpdated } }
-const historyCache = {}; // per device: array of last 2 days
-const userSettingsCache = {}; // { deviceId: { noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2, updatedAt } }
+const liveDataCache = {}; // { deviceId: { data, lastUpdated } }
+const historyCache = {}; // { deviceId: [last 2 days data] }
+const userSettingsCache = {}; // { deviceId: { noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2 } }
 
 // ===== API ROUTES =====
 
@@ -73,9 +71,8 @@ const userSettingsCache = {}; // { deviceId: { noAeratorsLine1, noAeratorsLine2,
 app.post("/api/data", async (req, res) => {
   try {
     const data = req.body;
-    if (!data.device_id) {
+    if (!data.device_id)
       return res.status(400).json({ status: "error", error: "device_id required" });
-    }
 
     const docId = getFormattedTimestamp();
     const formatted = formatData(data.device_id, data);
@@ -83,11 +80,8 @@ app.post("/api/data", async (req, res) => {
     // Save in Firestore
     await firestore.collection(data.device_id).doc(docId).set(formatted);
 
-    // Save in live data cache
-    liveDataCache[data.device_id] = {
-      data: formatted,
-      lastUpdated: Date.now(),
-    };
+    // Save in live cache
+    liveDataCache[data.device_id] = { data: formatted, lastUpdated: Date.now() };
 
     // Save in history cache (2-day rolling window)
     if (!historyCache[data.device_id]) historyCache[data.device_id] = [];
@@ -99,94 +93,89 @@ app.post("/api/data", async (req, res) => {
 
     log(`HTTP Data stored: ${data.device_id}/${docId}`);
 
-    // === AUTO NOTIFICATION CHECK ===
-    let alertStatus = "no_alert_needed";
+    // ===== NOTIFICATION CHECK =====
+    let alertSent = false;
+    let noAlertNeeded = true;
 
-    try {
-      let settings = userSettingsCache[data.device_id];
+    // Load cached calculation values if available
+    let deviceSettings = userSettingsCache[data.device_id];
+    if (!deviceSettings) {
+      // Load from Firestore once and cache
+      const snapshot = await firestore
+        .collection("users")
+        .where("deviceId", "==", data.device_id)
+        .get();
 
-      // Cold start → load useful fields from Firestore once
-      if (!settings) {
-        const snapshot = await firestore
-          .collection("users")
-          .where("deviceId", "==", data.device_id)
-          .get();
-
-        if (!snapshot.empty) {
-          const userDoc = snapshot.docs[0].data();
-          settings = {
-            noAeratorsLine1: userDoc.noAeratorsLine1 || 0,
-            noAeratorsLine2: userDoc.noAeratorsLine2 || 0,
-            perAerator_currentLine1: userDoc.perAerator_currentLine1 || 1,
-            perAerator_currentLine2: userDoc.perAerator_currentLine2 || 1,
-            fcmToken: userDoc.fcmToken || null,
-          };
-          userSettingsCache[data.device_id] = settings;
-          log(`Cached useful settings for deviceId=${data.device_id}`);
-        }
+      if (!snapshot.empty) {
+        // Use first user as reference for calculation values
+        const firstUser = snapshot.docs[0].data();
+        deviceSettings = {
+          noAeratorsLine1: firstUser.noAeratorsLine1 || 0,
+          noAeratorsLine2: firstUser.noAeratorsLine2 || 0,
+          perAerator_currentLine1: firstUser.perAerator_currentLine1 || 1,
+          perAerator_currentLine2: firstUser.perAerator_currentLine2 || 1,
+        };
+        userSettingsCache[data.device_id] = deviceSettings;
+        log(`Cached calculation values for deviceId=${data.device_id}`);
       }
-
-      if (settings) {
-        const ratio1 = Math.round(formatted.line1 / (settings.perAerator_currentLine1 || 1));
-        const ratio2 = Math.round(formatted.line2 / (settings.perAerator_currentLine2 || 1));
-
-        let alertMsg = "";
-        if (ratio1 < settings.noAeratorsLine1) {
-          alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${settings.noAeratorsLine1}. `;
-        }
-        if (ratio2 < settings.noAeratorsLine2) {
-          alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${settings.noAeratorsLine2}.`;
-        }
-
-        if (alertMsg) {
-          if (settings.fcmToken) {
-            const message = {
-              notification: {
-                title: "⚠️ Aerator Alert!",
-                body: `Device ${data.device_id}: ${alertMsg}`,
-              },
-              token: settings.fcmToken,
-            };
-
-            try {
-              await admin.messaging().send(message);
-              log(`✅ Alert sent to deviceId=${data.device_id}`);
-              alertStatus = "alert_sent";
-            } catch (err) {
-              log(`❌ Invalid/expired FCM token for deviceId=${data.device_id}`, "WARN");
-              alertStatus = "invalid_fcm_token";
-            }
-          } else {
-            log(`⚠️ No FCM token for device ${data.device_id}`, "WARN");
-            alertStatus = "no_fcm_token";
-          }
-        } else {
-          log(`ℹ️ No alert needed for device ${data.device_id}`);
-          alertStatus = "no_alert_needed";
-        }
-      } else {
-        log(`⚠️ No settings found for deviceId=${data.device_id}`, "WARN");
-        alertStatus = "no_settings_found";
-      }
-    } catch (err) {
-      log(`❌ Notification error: ${err}`, "ERROR");
-      alertStatus = "notification_error";
     }
 
-    res.json({ status: "success", stored: formatted, alertStatus });
+    if (deviceSettings) {
+      const snapshot = await firestore
+        .collection("users")
+        .where("deviceId", "==", data.device_id)
+        .get();
+
+      for (const doc of snapshot.docs) {
+        const userData = doc.data();
+        const ratio1 = Math.round(formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1));
+        const ratio2 = Math.round(formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1));
+
+        let alertMsg = "";
+        if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
+          alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
+        if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
+          alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
+
+        if (alertMsg) {
+          noAlertNeeded = false;
+          if (userData.fcmToken) {
+            const message = {
+              notification: { title: "⚠️ Aerator Alert!", body: `Device ${data.device_id}: ${alertMsg}` },
+              token: userData.fcmToken,
+            };
+            try {
+              await admin.messaging().send(message);
+              log(`✅ Alert sent to user ${doc.id} for device ${data.device_id}`);
+              alertSent = true;
+            } catch (err) {
+              if (err.code === "messaging/registration-token-not-registered") {
+                log(`❌ Invalid FCM token for user ${doc.id}`, "WARN");
+              } else {
+                log(`❌ Failed to send notification to user ${doc.id}: ${err.message}`, "ERROR");
+              }
+            }
+          } else {
+            log(`⚠️ No FCM token for user ${doc.id}`, "WARN");
+          }
+        }
+      }
+
+      if (noAlertNeeded) log(`ℹ️ No alert needed for device ${data.device_id}`);
+    }
+
+    res.json({ status: "success", stored: formatted, alertSent, noAlertNeeded });
   } catch (err) {
     log(`❌ Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
   }
 });
 
-
-// ===== PATCH USERS BY deviceId =====
+// ===== PATCH USERS BY deviceId (update calculation values) =====
 app.patch("/api/users/update", async (req, res) => {
   try {
     const { deviceId, noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2 } = req.body;
-
-    if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId is required" });
+    if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
 
     const updates = {};
     if (noAeratorsLine1 !== undefined) updates.noAeratorsLine1 = noAeratorsLine1;
@@ -205,21 +194,19 @@ app.patch("/api/users/update", async (req, res) => {
     snapshot.forEach((doc) => batch.update(doc.ref, updates));
     await batch.commit();
 
-    // Update only useful fields in cache
-    userSettingsCache[deviceId] = {
-      ...(userSettingsCache[deviceId] || {}),
-      ...updates,
-    };
+    // Update cache for calculation
+    if (!userSettingsCache[deviceId]) userSettingsCache[deviceId] = {};
+    Object.assign(userSettingsCache[deviceId], updates);
 
     res.json({ status: "success", message: `Updated ${snapshot.size} user(s)`, cache: userSettingsCache[deviceId] });
     log(`Updated ${snapshot.size} user(s) for deviceId=${deviceId}`);
-  } catch (error) {
-    log(`Error patching users: ${error}`, "ERROR");
-    res.status(500).json({ status: "error", error: error.message });
+  } catch (err) {
+    log(`Error patching users: ${err}`, "ERROR");
+    res.status(500).json({ status: "error", error: err.message });
   }
 });
 
-// ===== FETCH HISTORY (last 2 days only from cache) =====
+// ===== FETCH HISTORY =====
 app.get("/api/history/:deviceId", (req, res) => {
   const { deviceId } = req.params;
   if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
