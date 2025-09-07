@@ -1,9 +1,10 @@
 /**
- * Node.js Server for Firestore Storage + In-Memory Cache (no MQTT)
+ * Node.js Server for Firestore Storage + In-Memory Cache (optimized)
  * Stores last 2 days in server memory, full history optionally in Firestore
+ * Only caches useful user settings, not all user data
  */
 
-require("dotenv").config(); // Load .env variables
+require("dotenv").config();
 const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
@@ -12,7 +13,7 @@ const cors = require("cors");
 const PORT = 8080;
 const TWO_DAYS = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
 
-// ===== FIREBASE SETUP (using Base64 from .env) =====
+// ===== FIREBASE SETUP =====
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
   console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT_BASE64 in .env");
   process.exit(1);
@@ -79,21 +80,18 @@ app.post("/api/data", async (req, res) => {
     const docId = getFormattedTimestamp();
     const formatted = formatData(data.device_id, data);
 
-    // === Save in Firestore for long-term history ===
+    // Save in Firestore
     await firestore.collection(data.device_id).doc(docId).set(formatted);
 
-    // === Save in live data cache ===
+    // Save in live data cache
     liveDataCache[data.device_id] = {
       data: formatted,
       lastUpdated: Date.now(),
     };
 
-    // === Save in history cache (2-day rolling window) ===
-    if (!historyCache[data.device_id]) {
-      historyCache[data.device_id] = [];
-    }
+    // Save in history cache (2-day rolling window)
+    if (!historyCache[data.device_id]) historyCache[data.device_id] = [];
     historyCache[data.device_id].push(formatted);
-
     const cutoff = Date.now() - TWO_DAYS;
     historyCache[data.device_id] = historyCache[data.device_id].filter(
       (item) => item.timestamp.toMillis() >= cutoff
@@ -101,163 +99,141 @@ app.post("/api/data", async (req, res) => {
 
     log(`HTTP Data stored: ${data.device_id}/${docId}`);
 
-    // === 🚨 AUTO NOTIFICATION CHECK ===
+    // === AUTO NOTIFICATION CHECK ===
+    let alertStatus = "no_alert_needed";
+
     try {
       let settings = userSettingsCache[data.device_id];
 
-      // Cold start → load from Firestore once
+      // Cold start → load useful fields from Firestore once
       if (!settings) {
         const snapshot = await firestore
           .collection("users")
           .where("deviceId", "==", data.device_id)
           .get();
+
         if (!snapshot.empty) {
-          settings = snapshot.docs[0].data();
+          const userDoc = snapshot.docs[0].data();
+          settings = {
+            noAeratorsLine1: userDoc.noAeratorsLine1 || 0,
+            noAeratorsLine2: userDoc.noAeratorsLine2 || 0,
+            perAerator_currentLine1: userDoc.perAerator_currentLine1 || 1,
+            perAerator_currentLine2: userDoc.perAerator_currentLine2 || 1,
+            fcmToken: userDoc.fcmToken || null,
+          };
           userSettingsCache[data.device_id] = settings;
-          log(`Cached user settings for deviceId=${data.device_id}`);
+          log(`Cached useful settings for deviceId=${data.device_id}`);
         }
       }
 
       if (settings) {
-        const perAerator1 = settings.perAerator_currentLine1 || 1;
-        const noAerators1 = settings.noAeratorsLine1 || 0;
-        const ratio1 = Math.round(formatted.line1 / perAerator1);
-
-        const perAerator2 = settings.perAerator_currentLine2 || 1;
-        const noAerators2 = settings.noAeratorsLine2 || 0;
-        const ratio2 = Math.round(formatted.line2 / perAerator2);
+        const ratio1 = Math.round(formatted.line1 / (settings.perAerator_currentLine1 || 1));
+        const ratio2 = Math.round(formatted.line2 / (settings.perAerator_currentLine2 || 1));
 
         let alertMsg = "";
-        if (ratio1 < noAerators1) {
-          alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${noAerators1}. `;
+        if (ratio1 < settings.noAeratorsLine1) {
+          alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${settings.noAeratorsLine1}. `;
         }
-        if (ratio2 < noAerators2) {
-          alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${noAerators2}.`;
+        if (ratio2 < settings.noAeratorsLine2) {
+          alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${settings.noAeratorsLine2}.`;
         }
 
         if (alertMsg) {
-          const snapshot = await firestore
-            .collection("users")
-            .where("deviceId", "==", data.device_id)
-            .get();
+          if (settings.fcmToken) {
+            const message = {
+              notification: {
+                title: "⚠️ Aerator Alert!",
+                body: `Device ${data.device_id}: ${alertMsg}`,
+              },
+              token: settings.fcmToken,
+            };
 
-          snapshot.forEach(async (doc) => {
-            const userData = doc.data();
-            if (userData.fcmToken) {
-              const message = {
-                notification: {
-                  title: "⚠️ Aerator Alert!",
-                  body: `Device ${data.device_id}: ${alertMsg}`,
-                },
-                token: userData.fcmToken,
-              };
-
-              try {
-                await admin.messaging().send(message);
-                log(`Notification sent to ${userData.name || "Unknown"} (${doc.id})`);
-              } catch (err) {
-                if (err.code === "messaging/registration-token-not-registered") {
-                  log(`Invalid/expired fcmToken for user ${doc.id}`, "WARN");
-                } else {
-                  log(`Failed to send notification to ${doc.id}: ${err.message}`, "ERROR");
-                }
-              }
-            } else {
-              log(`No fcmToken for user ${doc.id}`, "WARN");
+            try {
+              await admin.messaging().send(message);
+              log(`✅ Alert sent to deviceId=${data.device_id}`);
+              alertStatus = "alert_sent";
+            } catch (err) {
+              log(`❌ Invalid/expired FCM token for deviceId=${data.device_id}`, "WARN");
+              alertStatus = "invalid_fcm_token";
             }
-          });
+          } else {
+            log(`⚠️ No FCM token for device ${data.device_id}`, "WARN");
+            alertStatus = "no_fcm_token";
+          }
         } else {
-          log(`No alert needed for device ${data.device_id}`);
+          log(`ℹ️ No alert needed for device ${data.device_id}`);
+          alertStatus = "no_alert_needed";
         }
       } else {
-        log(`No settings found in cache/Firestore for deviceId=${data.device_id}`, "WARN");
+        log(`⚠️ No settings found for deviceId=${data.device_id}`, "WARN");
+        alertStatus = "no_settings_found";
       }
     } catch (err) {
-      log(`Notification error: ${err}`, "ERROR");
+      log(`❌ Notification error: ${err}`, "ERROR");
+      alertStatus = "notification_error";
     }
 
-    res.json({ status: "success", stored: formatted });
+    res.json({ status: "success", stored: formatted, alertStatus });
   } catch (err) {
-    log(`Error saving HTTP data: ${err}`, "ERROR");
+    log(`❌ Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
   }
 });
 
-// ===== PATCH USERS BY deviceId (from body) =====
+
+// ===== PATCH USERS BY deviceId =====
 app.patch("/api/users/update", async (req, res) => {
   try {
     const { deviceId, noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2 } = req.body;
 
-    if (!deviceId) {
-      return res.status(400).json({ status: "error", error: "deviceId is required in body" });
-    }
+    if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId is required" });
 
-    // Collect only provided fields
     const updates = {};
     if (noAeratorsLine1 !== undefined) updates.noAeratorsLine1 = noAeratorsLine1;
     if (noAeratorsLine2 !== undefined) updates.noAeratorsLine2 = noAeratorsLine2;
     if (perAerator_currentLine1 !== undefined) updates.perAerator_currentLine1 = perAerator_currentLine1;
     if (perAerator_currentLine2 !== undefined) updates.perAerator_currentLine2 = perAerator_currentLine2;
 
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ status: "error", error: "At least one of the 4 fields must be provided" });
-    }
+    if (!Object.keys(updates).length) return res.status(400).json({ status: "error", error: "Provide at least one field" });
 
     updates.updatedAt = new Date().toISOString();
 
-    // Query all users with given deviceId
     const snapshot = await firestore.collection("users").where("deviceId", "==", deviceId).get();
+    if (snapshot.empty) return res.status(404).json({ status: "error", error: "No users found with this deviceId" });
 
-    if (snapshot.empty) {
-      return res.status(404).json({ status: "error", error: `No users found with deviceId=${deviceId}` });
-    }
-
-    // Batch update all matching docs
     const batch = firestore.batch();
-    snapshot.forEach((doc) => {
-      batch.update(doc.ref, updates);
-    });
+    snapshot.forEach((doc) => batch.update(doc.ref, updates));
     await batch.commit();
 
-    // Update cache
+    // Update only useful fields in cache
     userSettingsCache[deviceId] = {
       ...(userSettingsCache[deviceId] || {}),
       ...updates,
     };
 
-    res.json({ status: "success", message: `Updated ${snapshot.size} user(s) with deviceId ${deviceId}`, cache: userSettingsCache[deviceId] });
-    log(`Updated ${snapshot.size} user(s) with deviceId ${deviceId} (cache updated)`);
+    res.json({ status: "success", message: `Updated ${snapshot.size} user(s)`, cache: userSettingsCache[deviceId] });
+    log(`Updated ${snapshot.size} user(s) for deviceId=${deviceId}`);
   } catch (error) {
     log(`Error patching users: ${error}`, "ERROR");
     res.status(500).json({ status: "error", error: error.message });
   }
 });
 
-// Fetch history data (last 2 days from cache only)
+// ===== FETCH HISTORY (last 2 days only from cache) =====
 app.get("/api/history/:deviceId", (req, res) => {
   const { deviceId } = req.params;
-  if (!deviceId) {
-    return res.status(400).json({ status: "error", error: "deviceId required" });
-  }
+  if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
 
   const history = historyCache[deviceId] || [];
-  if (!history.length) {
-    return res.json({ status: "no_data", data: [] });
-  }
-
-  res.json({ status: "ok", data: history });
+  res.json({ status: history.length ? "ok" : "no_data", data: history });
 });
 
-// Fetch latest live data for a device
+// ===== FETCH LIVE DATA =====
 app.get("/api/data/:deviceId", (req, res) => {
   const { deviceId } = req.params;
-  if (!deviceId) {
-    return res.status(400).json({ status: "error", error: "deviceId required" });
-  }
+  if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
 
   const cacheEntry = liveDataCache[deviceId];
-
-  // If no data or older than 30s → return no_data
   if (!cacheEntry || Date.now() - cacheEntry.lastUpdated > 30000) {
     return res.json({ status: "no_data", data: "--" });
   }
@@ -265,16 +241,13 @@ app.get("/api/data/:deviceId", (req, res) => {
   res.json({ status: "ok", data: cacheEntry.data });
 });
 
-// Save relay control data
+// ===== RELAY CONTROL =====
 app.post("/api/relays", async (req, res) => {
   try {
     const { device_id, ...relays } = req.body;
-    if (!device_id) {
-      return res.status(400).json({ status: "error", error: "device_id required" });
-    }
+    if (!device_id) return res.status(400).json({ status: "error", error: "device_id required" });
 
     const docId = getFormattedTimestamp();
-
     await firestore.collection(`${device_id}_control`).doc(docId).set({
       device_id,
       ...relays,
