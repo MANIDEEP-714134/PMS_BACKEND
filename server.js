@@ -64,6 +64,7 @@ const formatData = (device_id, payload, firestoreTimestamp) => ({
 const liveDataCache = {}; // { deviceId: { data, lastUpdated } }
 const historyCache = {}; // { deviceId: [last 2 days data] }
 const userSettingsCache = {}; // { deviceId: { noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2 } }
+const alertStateCache = {}; // { deviceId: { active: true/false, lastAlert: timestamp } }
 
 // ===== API ROUTES =====
 
@@ -126,42 +127,53 @@ app.post("/api/data", async (req, res) => {
         .where("deviceId", "==", data.device_id)
         .get();
 
-      for (const doc of snapshot.docs) {
-        const userData = doc.data();
-        const ratio1 = Math.round(formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1));
-        const ratio2 = Math.round(formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1));
+      const ratio1 = Math.round(formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1));
+      const ratio2 = Math.round(formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1));
 
-        let alertMsg = "";
-        if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
-          alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
-        if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
-          alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
+      let alertMsg = "";
+      if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
+        alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
+      if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
+        alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
 
-        if (alertMsg) {
-          noAlertNeeded = false;
-          if (userData.fcmToken) {
-            const message = {
-              notification: { title: "⚠️ Aerator Alert!", body: `Device ${data.device_id}: ${alertMsg}` },
-              token: userData.fcmToken,
-            };
-            try {
-              await admin.messaging().send(message);
-              log(`✅ Alert sent to user ${doc.id} for device ${data.device_id}`);
-              alertSent = true;
-            } catch (err) {
-              if (err.code === "messaging/registration-token-not-registered") {
-                log(`❌ Invalid FCM token for user ${doc.id}`, "WARN");
-              } else {
-                log(`❌ Failed to send notification to user ${doc.id}: ${err.message}`, "ERROR");
+      const deviceAlertState = alertStateCache[data.device_id] || { active: false };
+
+      if (alertMsg) {
+        noAlertNeeded = false;
+
+        if (!deviceAlertState.active) {
+          for (const doc of snapshot.docs) {
+            const userData = doc.data();
+            if (userData.fcmToken) {
+              const message = {
+                notification: { title: "⚠️ Aerator Alert!", body: `Device ${data.device_id}: ${alertMsg}` },
+                token: userData.fcmToken,
+              };
+              try {
+                await admin.messaging().send(message);
+                log(`✅ Alert sent to user ${doc.id} for device ${data.device_id}`);
+                alertSent = true;
+              } catch (err) {
+                if (err.code === "messaging/registration-token-not-registered") {
+                  log(`❌ Invalid FCM token for user ${doc.id}`, "WARN");
+                } else {
+                  log(`❌ Failed to send notification to user ${doc.id}: ${err.message}`, "ERROR");
+                }
               }
+            } else {
+              log(`⚠️ No FCM token for user ${doc.id}`, "WARN");
             }
-          } else {
-            log(`⚠️ No FCM token for user ${doc.id}`, "WARN");
           }
+          alertStateCache[data.device_id] = { active: true, lastAlert: Date.now() };
+        } else {
+          log(`ℹ️ Alert already active for ${data.device_id}, skipping re-send`);
         }
+      } else {
+        if (deviceAlertState.active) {
+          log(`✅ Device ${data.device_id} recovered, clearing alert state`);
+        }
+        alertStateCache[data.device_id] = { active: false };
       }
-
-      if (noAlertNeeded) log(`ℹ️ No alert needed for device ${data.device_id}`);
     }
 
     res.json({ status: "success", stored: formatted, alertSent, noAlertNeeded });
