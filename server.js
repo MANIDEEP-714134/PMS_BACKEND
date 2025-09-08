@@ -19,7 +19,9 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
   process.exit(1);
 }
 const serviceAccount = JSON.parse(
-  Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
+  Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString(
+    "utf8"
+  )
 );
 
 admin.initializeApp({
@@ -73,7 +75,9 @@ app.post("/api/data", async (req, res) => {
   try {
     const data = req.body;
     if (!data.device_id)
-      return res.status(400).json({ status: "error", error: "device_id required" });
+      return res
+        .status(400)
+        .json({ status: "error", error: "device_id required" });
 
     const docId = getFormattedTimestamp();
     const formatted = formatData(data.device_id, data);
@@ -82,7 +86,10 @@ app.post("/api/data", async (req, res) => {
     await firestore.collection(data.device_id).doc(docId).set(formatted);
 
     // Save in live cache
-    liveDataCache[data.device_id] = { data: formatted, lastUpdated: Date.now() };
+    liveDataCache[data.device_id] = {
+      data: formatted,
+      lastUpdated: Date.now(),
+    };
 
     // Save in history cache (2-day rolling window)
     if (!historyCache[data.device_id]) historyCache[data.device_id] = [];
@@ -127,8 +134,12 @@ app.post("/api/data", async (req, res) => {
         .where("deviceId", "==", data.device_id)
         .get();
 
-      const ratio1 = Math.round(formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1));
-      const ratio2 = Math.round(formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1));
+      const ratio1 = Math.round(
+        formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1)
+      );
+      const ratio2 = Math.round(
+        formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1)
+      );
 
       let alertMsg = "";
       if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
@@ -136,7 +147,9 @@ app.post("/api/data", async (req, res) => {
       if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
         alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
 
-      const deviceAlertState = alertStateCache[data.device_id] || { active: false };
+      const deviceAlertState = alertStateCache[data.device_id] || {
+        active: false,
+      };
 
       if (alertMsg) {
         noAlertNeeded = false;
@@ -146,27 +159,52 @@ app.post("/api/data", async (req, res) => {
             const userData = doc.data();
             if (userData.fcmToken) {
               const message = {
-                notification: { title: "⚠️ Aerator Alert!", body: `Device ${data.device_id}: ${alertMsg}` },
+                notification: {
+                  title: "⚠️ Aerator Alert!",
+                  body: `Device ${data.device_id}: ${alertMsg}`,
+                },
+                android: {
+                  notification: {
+                    channelId: "alarm_channel", // Must match the NotificationChannel on Android
+                    sound: "alarm", // The file in res/raw/alarm.mp3
+                    priority: "high",
+                    defaultVibrateTimings: true,
+                    defaultLightSettings: true,
+                  },
+                },
+
                 token: userData.fcmToken,
               };
               try {
                 await admin.messaging().send(message);
-                log(`✅ Alert sent to user ${doc.id} for device ${data.device_id}`);
+                log(
+                  `✅ Alert sent to user ${doc.id} for device ${data.device_id}`
+                );
                 alertSent = true;
               } catch (err) {
-                if (err.code === "messaging/registration-token-not-registered") {
+                if (
+                  err.code === "messaging/registration-token-not-registered"
+                ) {
                   log(`❌ Invalid FCM token for user ${doc.id}`, "WARN");
                 } else {
-                  log(`❌ Failed to send notification to user ${doc.id}: ${err.message}`, "ERROR");
+                  log(
+                    `❌ Failed to send notification to user ${doc.id}: ${err.message}`,
+                    "ERROR"
+                  );
                 }
               }
             } else {
               log(`⚠️ No FCM token for user ${doc.id}`, "WARN");
             }
           }
-          alertStateCache[data.device_id] = { active: true, lastAlert: Date.now() };
+          alertStateCache[data.device_id] = {
+            active: true,
+            lastAlert: Date.now(),
+          };
         } else {
-          log(`ℹ️ Alert already active for ${data.device_id}, skipping re-send`);
+          log(
+            `ℹ️ Alert already active for ${data.device_id}, skipping re-send`
+          );
         }
       } else {
         if (deviceAlertState.active) {
@@ -176,7 +214,12 @@ app.post("/api/data", async (req, res) => {
       }
     }
 
-    res.json({ status: "success", stored: formatted, alertSent, noAlertNeeded });
+    res.json({
+      status: "success",
+      stored: formatted,
+      alertSent,
+      noAlertNeeded,
+    });
   } catch (err) {
     log(`❌ Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
@@ -186,21 +229,43 @@ app.post("/api/data", async (req, res) => {
 // ===== PATCH USERS BY deviceId (update calculation values) =====
 app.patch("/api/users/update", async (req, res) => {
   try {
-    const { deviceId, noAeratorsLine1, noAeratorsLine2, perAerator_currentLine1, perAerator_currentLine2 } = req.body;
-    if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
+    const {
+      deviceId,
+      noAeratorsLine1,
+      noAeratorsLine2,
+      perAerator_currentLine1,
+      perAerator_currentLine2,
+    } = req.body;
+    if (!deviceId)
+      return res
+        .status(400)
+        .json({ status: "error", error: "deviceId required" });
 
     const updates = {};
-    if (noAeratorsLine1 !== undefined) updates.noAeratorsLine1 = noAeratorsLine1;
-    if (noAeratorsLine2 !== undefined) updates.noAeratorsLine2 = noAeratorsLine2;
-    if (perAerator_currentLine1 !== undefined) updates.perAerator_currentLine1 = perAerator_currentLine1;
-    if (perAerator_currentLine2 !== undefined) updates.perAerator_currentLine2 = perAerator_currentLine2;
+    if (noAeratorsLine1 !== undefined)
+      updates.noAeratorsLine1 = noAeratorsLine1;
+    if (noAeratorsLine2 !== undefined)
+      updates.noAeratorsLine2 = noAeratorsLine2;
+    if (perAerator_currentLine1 !== undefined)
+      updates.perAerator_currentLine1 = perAerator_currentLine1;
+    if (perAerator_currentLine2 !== undefined)
+      updates.perAerator_currentLine2 = perAerator_currentLine2;
 
-    if (!Object.keys(updates).length) return res.status(400).json({ status: "error", error: "Provide at least one field" });
+    if (!Object.keys(updates).length)
+      return res
+        .status(400)
+        .json({ status: "error", error: "Provide at least one field" });
 
     updates.updatedAt = new Date().toISOString();
 
-    const snapshot = await firestore.collection("users").where("deviceId", "==", deviceId).get();
-    if (snapshot.empty) return res.status(404).json({ status: "error", error: "No users found with this deviceId" });
+    const snapshot = await firestore
+      .collection("users")
+      .where("deviceId", "==", deviceId)
+      .get();
+    if (snapshot.empty)
+      return res
+        .status(404)
+        .json({ status: "error", error: "No users found with this deviceId" });
 
     const batch = firestore.batch();
     snapshot.forEach((doc) => batch.update(doc.ref, updates));
@@ -210,7 +275,11 @@ app.patch("/api/users/update", async (req, res) => {
     if (!userSettingsCache[deviceId]) userSettingsCache[deviceId] = {};
     Object.assign(userSettingsCache[deviceId], updates);
 
-    res.json({ status: "success", message: `Updated ${snapshot.size} user(s)`, cache: userSettingsCache[deviceId] });
+    res.json({
+      status: "success",
+      message: `Updated ${snapshot.size} user(s)`,
+      cache: userSettingsCache[deviceId],
+    });
     log(`Updated ${snapshot.size} user(s) for deviceId=${deviceId}`);
   } catch (err) {
     log(`Error patching users: ${err}`, "ERROR");
@@ -221,7 +290,10 @@ app.patch("/api/users/update", async (req, res) => {
 // ===== FETCH HISTORY =====
 app.get("/api/history/:deviceId", (req, res) => {
   const { deviceId } = req.params;
-  if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
+  if (!deviceId)
+    return res
+      .status(400)
+      .json({ status: "error", error: "deviceId required" });
 
   const history = historyCache[deviceId] || [];
   res.json({ status: history.length ? "ok" : "no_data", data: history });
@@ -230,7 +302,10 @@ app.get("/api/history/:deviceId", (req, res) => {
 // ===== FETCH LIVE DATA =====
 app.get("/api/data/:deviceId", (req, res) => {
   const { deviceId } = req.params;
-  if (!deviceId) return res.status(400).json({ status: "error", error: "deviceId required" });
+  if (!deviceId)
+    return res
+      .status(400)
+      .json({ status: "error", error: "deviceId required" });
 
   const cacheEntry = liveDataCache[deviceId];
   if (!cacheEntry || Date.now() - cacheEntry.lastUpdated > 30000) {
@@ -244,14 +319,20 @@ app.get("/api/data/:deviceId", (req, res) => {
 app.post("/api/relays", async (req, res) => {
   try {
     const { device_id, ...relays } = req.body;
-    if (!device_id) return res.status(400).json({ status: "error", error: "device_id required" });
+    if (!device_id)
+      return res
+        .status(400)
+        .json({ status: "error", error: "device_id required" });
 
     const docId = getFormattedTimestamp();
-    await firestore.collection(`${device_id}_control`).doc(docId).set({
-      device_id,
-      ...relays,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    await firestore
+      .collection(`${device_id}_control`)
+      .doc(docId)
+      .set({
+        device_id,
+        ...relays,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
 
     res.json({ status: "success", device_id, updated: relays });
     log(`Relay data saved for ${device_id}`);
