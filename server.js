@@ -147,6 +147,16 @@ app.post("/api/data", async (req, res) => {
             if (userData.fcmToken) {
               const message = {
                 notification: { title: "⚠️ Aerator Alert!", body: `Device ${data.device_id}: ${alertMsg}` },
+                  android: {
+                notification: {
+                  channelId: "alarm_channel",  // Must match the NotificationChannel on Android
+                  sound: "alarm",              // The file in res/raw/alarm.mp3
+                  priority: "high",
+                  defaultVibrateTimings: true,
+                  defaultLightSettings: true,
+                },
+              },
+
                 token: userData.fcmToken,
               };
               try {
