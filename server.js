@@ -340,5 +340,65 @@ app.post("/api/relays", async (req, res) => {
   }
 });
 
+// ===== TEST NOTIFICATION API (matches /api/data payload) =====
+app.post("/api/test-notification", async (req, res) => {
+  try {
+    const { fcmToken, title, body } = req.body;
+
+    if (!fcmToken || !title || !body) {
+      return res.status(400).json({
+        status: "error",
+        error: "fcmToken, title, and body are required",
+      });
+    }
+
+    // Same payload as in /api/data alerts
+    const message = {
+      token: fcmToken,
+      notification: {
+        title,
+        body,
+      },
+      android: {
+        priority: "HIGH",
+        notification: {
+          channel_id: "alarm_channel",
+          sound: "alarm",
+        },
+      },
+    };
+
+    const response = await admin.messaging().send(message);
+
+    log(`✅ Test notification sent to token: ${fcmToken}`);
+    res.json({
+      status: "success",
+      validity: "valid",
+      messageId: response,
+      payload: message,
+    });
+  } catch (err) {
+    if (
+      err.code === "messaging/invalid-argument" ||
+      err.code === "messaging/registration-token-not-registered"
+    ) {
+      log(`❌ Invalid or expired FCM token: ${req.body.fcmToken}`, "ERROR");
+      return res.status(400).json({
+        status: "error",
+        validity: "invalid",
+        error: "Invalid or expired FCM token",
+      });
+    }
+
+    log(`❌ Failed to send test notification: ${err.message}`, "ERROR");
+    res.status(500).json({
+      status: "error",
+      validity: "unknown",
+      error: err.message,
+    });
+  }
+});
+
+
 // ===== START SERVER =====
 app.listen(PORT, () => log(`Server running on port ${PORT}`));
