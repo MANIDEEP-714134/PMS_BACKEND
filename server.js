@@ -159,21 +159,19 @@ app.post("/api/data", async (req, res) => {
             const userData = doc.data();
             if (userData.fcmToken) {
               const message = {
-                message: {
-                  token: userData.fcmToken,
+                token: userData.fcmToken,
+                notification: {
+                  title: "⚠️ Aerator Alert!",
+                  body: `Device ${data.device_id}: ${alertMsg}`,
+                },
+                data: {
+                  alarm: "1",
+                },
+                android: {
+                  priority: "HIGH",
                   notification: {
-                    title: "⚠️ Aerator Alert!",
-                    body: `Device ${data.device_id}: ${alertMsg}`,
-                  },
-                  data: {
-                    alarm: "1", // custom key-value payload
-                  },
-                  android: {
-                    priority: "HIGH",
-                    notification: {
-                      channel_id: "alarm_channel", // matches NotificationChannel on Android
-                      sound: "alarm", // must exist in res/raw
-                    },
+                    channel_id: "alarm_channel",
+                    sound: "alarm",
                   },
                 },
               };
