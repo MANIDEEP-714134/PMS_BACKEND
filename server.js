@@ -177,8 +177,24 @@ app.post("/api/data", async (req, res) => {
                   },
                 },
               };
-
-              // then send it with admin.messaging().send(message)
+              try {
+                await admin.messaging().send(message);
+                log(
+                  `✅ Alert sent to user ${doc.id} for device ${data.device_id}`
+                );
+                alertSent = true;
+              } catch (err) {
+                if (
+                  err.code === "messaging/registration-token-not-registered"
+                ) {
+                  log(`❌ Invalid FCM token for user ${doc.id}`, "WARN");
+                } else {
+                  log(
+                    `❌ Failed to send notification to user ${doc.id}: ${err.message}`,
+                    "ERROR"
+                  );
+                }
+              }
             } else {
               log(`⚠️ No FCM token for user ${doc.id}`, "WARN");
             }
