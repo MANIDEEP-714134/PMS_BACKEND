@@ -164,9 +164,7 @@ app.post("/api/data", async (req, res) => {
                   title: "⚠️ Aerator Alert!",
                   body: `Device ${data.device_id}: ${alertMsg}`,
                 },
-                data: {
-                  alarm: "1",
-                },
+                
                 android: {
                   priority: "HIGH",
                   notification: {
