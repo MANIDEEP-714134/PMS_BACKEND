@@ -144,7 +144,7 @@ app.post("/api/data", async (req, res) => {
       let alertMsg = "";
       if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
         alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
-      if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
+      if (ratio2 < (deviceSettings.noAeratorsLine2-1 || 0))
         alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
 
       const deviceAlertState = alertStateCache[data.device_id] || {
