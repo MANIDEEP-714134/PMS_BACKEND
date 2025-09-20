@@ -154,7 +154,9 @@ app.post("/api/data", async (req, res) => {
 
       // Handle FCM sending (optional, may fail, does not affect alertTriggered)
       if (alertMsg) {
-        const deviceAlertState = alertStateCache[data.device_id] || { active: false };
+        const deviceAlertState = alertStateCache[data.device_id] || {
+          active: false,
+        };
         if (!deviceAlertState.active) {
           for (const doc of snapshot.docs) {
             const userData = doc.data();
@@ -177,14 +179,22 @@ app.post("/api/data", async (req, res) => {
                 await admin.messaging().send(message);
                 alertSent = true;
               } catch (err) {
-                log(`❌ Failed to send FCM for user ${doc.id}: ${err.message}`, "WARN");
+                log(
+                  `❌ Failed to send FCM for user ${doc.id}: ${err.message}`,
+                  "WARN"
+                );
               }
             }
           }
-          alertStateCache[data.device_id] = { active: true, lastAlert: Date.now() };
+          alertStateCache[data.device_id] = {
+            active: true,
+            lastAlert: Date.now(),
+          };
         }
       } else {
-        const deviceAlertState = alertStateCache[data.device_id] || { active: false };
+        const deviceAlertState = alertStateCache[data.device_id] || {
+          active: false,
+        };
         if (deviceAlertState.active) {
           log(`✅ Device ${data.device_id} recovered, clearing alert state`);
         }
@@ -193,28 +203,27 @@ app.post("/api/data", async (req, res) => {
     }
 
     // RESPOND WITH 201 IF CONDITION EXISTS, EVEN IF ALERT FAILED
-    if (alertTriggered) {
-      return res.status(201).json({
+    if (alertMsg) {
+      res.status(201).json({
         status: "alert",
-        stored: formatted,
         alertSent,
-        noAlertNeeded,
+        guardianNumber1: "9391392506",
+        guardianNumber2: "9866641249",
+        message: alertMsg,
       });
     } else {
-      return res.status(200).json({
+      res.status(200).json({
         status: "success",
         stored: formatted,
         alertSent,
         noAlertNeeded,
       });
     }
-
   } catch (err) {
     log(`❌ Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
   }
 });
-
 
 // ===== PATCH USERS BY deviceId (update calculation values) =====
 app.patch("/api/users/update", async (req, res) => {
@@ -396,7 +405,9 @@ app.get("/api/guardians/user/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
     if (!userId) {
-      return res.status(400).json({ status: "error", error: "userId required" });
+      return res
+        .status(400)
+        .json({ status: "error", error: "userId required" });
     }
 
     // Query Firestore for the user with this userId
@@ -416,12 +427,13 @@ app.get("/api/guardians/user/:userId", async (req, res) => {
 
     res.json({ status: "success", userId, guardians });
   } catch (err) {
-    console.error(`Error fetching guardians for user ${req.params.userId}:`, err);
+    console.error(
+      `Error fetching guardians for user ${req.params.userId}:`,
+      err
+    );
     res.status(500).json({ status: "error", error: err.message });
   }
 });
-
-
 
 // ===== START SERVER =====
 app.listen(PORT, () => log(`Server running on port ${PORT}`));
