@@ -126,7 +126,7 @@ app.post("/api/data", async (req, res) => {
         log(`Cached calculation values for deviceId=${data.device_id}`);
       }
     }
-
+    let alertMsg = "";
     if (deviceSettings) {
       const snapshot = await firestore
         .collection("users")
@@ -140,7 +140,7 @@ app.post("/api/data", async (req, res) => {
         formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1)
       );
 
-      let alertMsg = "";
+   
       if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
         alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
       if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
