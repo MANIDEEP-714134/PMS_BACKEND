@@ -399,6 +399,37 @@ app.post("/api/test-notification", async (req, res) => {
   }
 });
 
+// ===== GET GUARDIAN NUMBERS BY USER ID =====
+app.get("/api/guardians/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) {
+      return res.status(400).json({ status: "error", error: "userId required" });
+    }
+
+    // Query Firestore for the user with this userId
+    const doc = await firestore.collection("users").doc(userId).get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ status: "error", error: "User not found" });
+    }
+
+    const data = doc.data();
+
+    const guardians = {
+      userName: data.name || "",
+      guardianNumber1: data.guardianNumber1 || "",
+      guardianNumber2: data.guardianNumber2 || "",
+    };
+
+    res.json({ status: "success", userId, guardians });
+  } catch (err) {
+    console.error(`Error fetching guardians for user ${req.params.userId}:`, err);
+    res.status(500).json({ status: "error", error: err.message });
+  }
+});
+
+
 
 // ===== START SERVER =====
 app.listen(PORT, () => log(`Server running on port ${PORT}`));
