@@ -104,18 +104,17 @@ app.post("/api/data", async (req, res) => {
     // ===== NOTIFICATION CHECK =====
     let alertSent = false;
     let noAlertNeeded = true;
+    let alertTriggered = false; // ALERT CONDITION FLAG
 
     // Load cached calculation values if available
     let deviceSettings = userSettingsCache[data.device_id];
     if (!deviceSettings) {
-      // Load from Firestore once and cache
       const snapshot = await firestore
         .collection("users")
         .where("deviceId", "==", data.device_id)
         .get();
 
       if (!snapshot.empty) {
-        // Use first user as reference for calculation values
         const firstUser = snapshot.docs[0].data();
         deviceSettings = {
           noAeratorsLine1: firstUser.noAeratorsLine1 || 0,
@@ -144,16 +143,18 @@ app.post("/api/data", async (req, res) => {
       let alertMsg = "";
       if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
         alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
-      if (ratio2 < (deviceSettings.noAeratorsLine2-1 || 0))
+      if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
         alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
 
-      const deviceAlertState = alertStateCache[data.device_id] || {
-        active: false,
-      };
-
+      // SET alertTriggered BASED PURELY ON CONDITION
       if (alertMsg) {
+        alertTriggered = true;
         noAlertNeeded = false;
+      }
 
+      // Handle FCM sending (optional, may fail, does not affect alertTriggered)
+      if (alertMsg) {
+        const deviceAlertState = alertStateCache[data.device_id] || { active: false };
         if (!deviceAlertState.active) {
           for (const doc of snapshot.docs) {
             const userData = doc.data();
@@ -164,7 +165,6 @@ app.post("/api/data", async (req, res) => {
                   title: "⚠️ Aerator Alert!",
                   body: `Device ${data.device_id}: ${alertMsg}`,
                 },
-                
                 android: {
                   priority: "HIGH",
                   notification: {
@@ -175,36 +175,16 @@ app.post("/api/data", async (req, res) => {
               };
               try {
                 await admin.messaging().send(message);
-                log(
-                  `✅ Alert sent to user ${doc.id} for device ${data.device_id}`
-                );
                 alertSent = true;
               } catch (err) {
-                if (
-                  err.code === "messaging/registration-token-not-registered"
-                ) {
-                  log(`❌ Invalid FCM token for user ${doc.id}`, "WARN");
-                } else {
-                  log(
-                    `❌ Failed to send notification to user ${doc.id}: ${err.message}`,
-                    "ERROR"
-                  );
-                }
+                log(`❌ Failed to send FCM for user ${doc.id}: ${err.message}`, "WARN");
               }
-            } else {
-              log(`⚠️ No FCM token for user ${doc.id}`, "WARN");
             }
           }
-          alertStateCache[data.device_id] = {
-            active: true,
-            lastAlert: Date.now(),
-          };
-        } else {
-          log(
-            `ℹ️ Alert already active for ${data.device_id}, skipping re-send`
-          );
+          alertStateCache[data.device_id] = { active: true, lastAlert: Date.now() };
         }
       } else {
+        const deviceAlertState = alertStateCache[data.device_id] || { active: false };
         if (deviceAlertState.active) {
           log(`✅ Device ${data.device_id} recovered, clearing alert state`);
         }
@@ -212,17 +192,29 @@ app.post("/api/data", async (req, res) => {
       }
     }
 
-    res.json({
-      status: "success",
-      stored: formatted,
-      alertSent,
-      noAlertNeeded,
-    });
+    // RESPOND WITH 201 IF CONDITION EXISTS, EVEN IF ALERT FAILED
+    if (alertTriggered) {
+      return res.status(201).json({
+        status: "alert",
+        stored: formatted,
+        alertSent,
+        noAlertNeeded,
+      });
+    } else {
+      return res.status(200).json({
+        status: "success",
+        stored: formatted,
+        alertSent,
+        noAlertNeeded,
+      });
+    }
+
   } catch (err) {
     log(`❌ Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
   }
 });
+
 
 // ===== PATCH USERS BY deviceId (update calculation values) =====
 app.patch("/api/users/update", async (req, res) => {
