@@ -9,6 +9,7 @@ const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
 
+
 // ===== CONFIG =====
 const PORT = 8080;
 const TWO_DAYS = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
@@ -71,144 +72,145 @@ const alertStateCache = {}; // { deviceId: { active: true/false, lastAlert: time
 // ===== API ROUTES =====
 
 // Store incoming data
-app.post("/api/data", async (req, res) => {
-  try {
-    const data = req.body;
-    if (!data.device_id)
-      return res
-        .status(400)
-        .json({ status: "error", error: "device_id required" });
+const mqtt = require("mqtt");
 
-    const docId = getFormattedTimestamp();
-    const formatted = formatData(data.device_id, data);
+// ===== MQTT CONFIG =====
+const MQTT_BROKER = process.env.MQTT_BROKER || "mqtt://broker.emqx.io";
+const MQTT_TOPIC = process.env.MQTT_TOPIC || "PMS/data";
+const mqttClient = mqtt.connect(MQTT_BROKER);
 
-    // Save in Firestore
-    await firestore.collection(data.device_id).doc(docId).set(formatted);
+// ===== CORE PROCESSING FUNCTION =====
+async function processDeviceData(data, source = "http") {
+  if (!data.device_id) throw new Error("device_id required");
 
-    // Save in live cache
-    liveDataCache[data.device_id] = {
-      data: formatted,
-      lastUpdated: Date.now(),
-    };
+  const docId = getFormattedTimestamp();
+  const formatted = formatData(data.device_id, data);
 
-    // Save in history cache (2-day rolling window)
-    if (!historyCache[data.device_id]) historyCache[data.device_id] = [];
-    historyCache[data.device_id].push(formatted);
-    const cutoff = Date.now() - TWO_DAYS;
-    historyCache[data.device_id] = historyCache[data.device_id].filter(
-      (item) => item.timestamp.toMillis() >= cutoff
+  // Save in Firestore
+  await firestore.collection(data.device_id).doc(docId).set(formatted);
+
+  // Save in live cache
+  liveDataCache[data.device_id] = {
+    data: formatted,
+    lastUpdated: Date.now(),
+  };
+
+  // Save in history cache (2-day rolling window)
+  if (!historyCache[data.device_id]) historyCache[data.device_id] = [];
+  historyCache[data.device_id].push(formatted);
+  const cutoff = Date.now() - TWO_DAYS;
+  historyCache[data.device_id] = historyCache[data.device_id].filter(
+    (item) => item.timestamp.toMillis() >= cutoff
+  );
+
+  log(`[${source.toUpperCase()}] Data stored: ${data.device_id}/${docId}`);
+
+  // ========== NOTIFICATION CHECK (same as your existing logic) ==========
+  let alertSent = false;
+  let noAlertNeeded = true;
+  let alertMsg = "";
+
+  let deviceSettings = userSettingsCache[data.device_id];
+  if (!deviceSettings) {
+    const snapshot = await firestore
+      .collection("users")
+      .where("deviceId", "==", data.device_id)
+      .get();
+
+    if (!snapshot.empty) {
+      const firstUser = snapshot.docs[0].data();
+      deviceSettings = {
+        noAeratorsLine1: firstUser.noAeratorsLine1 || 0,
+        noAeratorsLine2: firstUser.noAeratorsLine2 || 0,
+        perAerator_currentLine1: firstUser.perAerator_currentLine1 || 1,
+        perAerator_currentLine2: firstUser.perAerator_currentLine2 || 1,
+      };
+      userSettingsCache[data.device_id] = deviceSettings;
+      log(`Cached calculation values for deviceId=${data.device_id}`);
+    }
+  }
+
+  if (deviceSettings) {
+    const snapshot = await firestore
+      .collection("users")
+      .where("deviceId", "==", data.device_id)
+      .get();
+
+    const ratio1 = Math.round(
+      formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1)
+    );
+    const ratio2 = Math.round(
+      formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1)
     );
 
-    log(`HTTP Data stored: ${data.device_id}/${docId}`);
+    if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
+      alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
+    if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
+      alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
 
-    // ===== NOTIFICATION CHECK =====
-    let alertSent = false;
-    let noAlertNeeded = true;
-    let alertTriggered = false; // ALERT CONDITION FLAG
-
-    // Load cached calculation values if available
-    let deviceSettings = userSettingsCache[data.device_id];
-    if (!deviceSettings) {
-      const snapshot = await firestore
-        .collection("users")
-        .where("deviceId", "==", data.device_id)
-        .get();
-
-      if (!snapshot.empty) {
-        const firstUser = snapshot.docs[0].data();
-        deviceSettings = {
-          noAeratorsLine1: firstUser.noAeratorsLine1 || 0,
-          noAeratorsLine2: firstUser.noAeratorsLine2 || 0,
-          perAerator_currentLine1: firstUser.perAerator_currentLine1 || 1,
-          perAerator_currentLine2: firstUser.perAerator_currentLine2 || 1,
-        };
-        userSettingsCache[data.device_id] = deviceSettings;
-        log(`Cached calculation values for deviceId=${data.device_id}`);
-      }
-    }
-    let alertMsg = "";
-    if (deviceSettings) {
-      const snapshot = await firestore
-        .collection("users")
-        .where("deviceId", "==", data.device_id)
-        .get();
-
-      const ratio1 = Math.round(
-        formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1)
-      );
-      const ratio2 = Math.round(
-        formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1)
-      );
-
-   
-      if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
-        alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
-      if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
-        alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
-
-      // SET alertTriggered BASED PURELY ON CONDITION
-      if (alertMsg) {
-        alertTriggered = true;
-        noAlertNeeded = false;
-      }
-
-      // Handle FCM sending (optional, may fail, does not affect alertTriggered)
-      if (alertMsg) {
-        const deviceAlertState = alertStateCache[data.device_id] || {
-          active: false,
-        };
-        if (!deviceAlertState.active) {
-          for (const doc of snapshot.docs) {
-            const userData = doc.data();
-            if (userData.fcmToken) {
-              const message = {
-                token: userData.fcmToken,
+    if (alertMsg) {
+      noAlertNeeded = false;
+      const deviceAlertState = alertStateCache[data.device_id] || {
+        active: false,
+      };
+      if (!deviceAlertState.active) {
+        for (const doc of snapshot.docs) {
+          const userData = doc.data();
+          if (userData.fcmToken) {
+            const message = {
+              token: userData.fcmToken,
+              notification: {
+                title: "⚠️ Aerator Alert!",
+                body: `Device ${data.device_id}: ${alertMsg}`,
+              },
+              android: {
+                priority: "HIGH",
                 notification: {
-                  title: "⚠️ Aerator Alert!",
-                  body: `Device ${data.device_id}: ${alertMsg}`,
+                  channel_id: "alarm_channel",
+                  sound: "alarm",
                 },
-                android: {
-                  priority: "HIGH",
-                  notification: {
-                    channel_id: "alarm_channel",
-                    sound: "alarm",
-                  },
-                },
-              };
-              try {
-                await admin.messaging().send(message);
-                alertSent = true;
-              } catch (err) {
-                log(
-                  `❌ Failed to send FCM for user ${doc.id}: ${err.message}`,
-                  "WARN"
-                );
-              }
+              },
+            };
+            try {
+              await admin.messaging().send(message);
+              alertSent = true;
+            } catch (err) {
+              log(
+                `❌ Failed to send FCM for user ${doc.id}: ${err.message}`,
+                "WARN"
+              );
             }
           }
-          alertStateCache[data.device_id] = {
-            active: true,
-            lastAlert: Date.now(),
-          };
         }
-      } else {
-        const deviceAlertState = alertStateCache[data.device_id] || {
-          active: false,
+        alertStateCache[data.device_id] = {
+          active: true,
+          lastAlert: Date.now(),
         };
-        if (deviceAlertState.active) {
-          log(`✅ Device ${data.device_id} recovered, clearing alert state`);
-        }
-        alertStateCache[data.device_id] = { active: false };
       }
+    } else {
+      const deviceAlertState = alertStateCache[data.device_id] || {
+        active: false,
+      };
+      if (deviceAlertState.active) {
+        log(`✅ Device ${data.device_id} recovered, clearing alert state`);
+      }
+      alertStateCache[data.device_id] = { active: false };
     }
+  }
 
-    // RESPOND WITH 201 IF CONDITION EXISTS, EVEN IF ALERT FAILED
+  return { formatted, alertSent, alertMsg, noAlertNeeded };
+}
+
+// ===== HTTP ENDPOINT (reuses processDeviceData) =====
+app.post("/api/data", async (req, res) => {
+  try {
+    const { formatted, alertSent, alertMsg, noAlertNeeded } =
+      await processDeviceData(req.body, "http");
+
     if (alertMsg) {
       res.status(201).json({
         status: "alert",
         alertSent,
-        guardianNumber1: "9391392506",
-        guardianNumber2: "9866641249",
         message: alertMsg,
       });
     } else {
@@ -224,6 +226,61 @@ app.post("/api/data", async (req, res) => {
     res.status(500).json({ status: "error", error: err.message });
   }
 });
+
+// ===== MQTT HANDLER =====
+// ===== MQTT CONFIG =====
+
+// ===== MQTT DEBUG HANDLER =====
+mqttClient.on("connect", () => {
+  console.log("✅ Connected to MQTT broker");
+  mqttClient.subscribe(MQTT_TOPIC, (err) => {
+    if (err) {
+      console.error("❌ Failed to subscribe:", err);
+    } else {
+      console.log(`📡 Subscribed to topic: ${MQTT_TOPIC}`);
+    }
+  });
+});
+
+mqttClient.on("message", async (topic, message) => {
+  console.log("📩 Incoming MQTT Message");
+  console.log("   📌 Topic:", topic);
+  console.log("   📦 Raw Payload:", message.toString());
+
+  try {
+    const parsed = JSON.parse(message.toString());
+    console.log("   ✅ Parsed JSON:", parsed);
+
+    // 🔥 Store into Firestore + cache
+    const { formatted, alertSent, alertMsg, noAlertNeeded } =
+      await processDeviceData(parsed, "mqtt");
+
+    console.log("   💾 Stored to Firestore:", formatted.device_id);
+    if (alertMsg) {
+      console.log("   🚨 Alert Triggered:", alertMsg);
+      console.log("   📲 FCM sent?", alertSent);
+    } else {
+      console.log("   ✅ No alert needed");
+    }
+  } catch (err) {
+    console.error("   ❌ Failed to parse/process message:", err.message);
+  }
+});
+
+
+mqttClient.on("error", (err) => {
+  console.error("❌ MQTT Error:", err);
+});
+
+mqttClient.on("close", () => {
+  console.log("⚠️ MQTT connection closed");
+});
+
+mqttClient.on("reconnect", () => {
+  console.log("🔄 Reconnecting to MQTT broker...");
+});
+
+
 
 // ===== PATCH USERS BY deviceId (update calculation values) =====
 app.patch("/api/users/update", async (req, res) => {
