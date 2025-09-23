@@ -208,7 +208,7 @@ app.post("/api/data", async (req, res) => {
       await processDeviceData(req.body, "http");
 
     if (alertMsg) {
-      res.status(201).json({
+      res.status(200).json({
         status: "alert",
         alertSent,
         message: alertMsg,
