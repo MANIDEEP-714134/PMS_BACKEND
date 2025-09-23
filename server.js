@@ -9,7 +9,6 @@ const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
 
-
 // ===== CONFIG =====
 const PORT = 8080;
 const TWO_DAYS = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
@@ -201,6 +200,19 @@ async function processDeviceData(data, source = "http") {
   return { formatted, alertSent, alertMsg, noAlertNeeded };
 }
 
+function publishCommand(command) {
+  const topic = "PMS/cmd";
+  const payload = JSON.stringify(command);
+
+  mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
+    if (err) {
+      log(`❌ Failed to publish command: ${err.message}`, "ERROR");
+    } else {
+      log(`📢 Command published to ${topic}: ${payload}`);
+    }
+  });
+}
+
 // ===== HTTP ENDPOINT (reuses processDeviceData) =====
 app.post("/api/data", async (req, res) => {
   try {
@@ -208,10 +220,15 @@ app.post("/api/data", async (req, res) => {
       await processDeviceData(req.body, "http");
 
     if (alertMsg) {
-      res.status(200).json({
-        status: "alert",
-        alertSent,
-        message: alertMsg,
+      // existing FCM logic...
+
+      // 🔥 ALSO publish command to PMS/cmd
+      publishCommand({
+        deviceID: data.device_id,
+        relay1: false,
+        relay2: false,
+        GAURD1: "+919866641249", // replace with real guardian number from Firestore if needed
+        bool: true,
       });
     } else {
       res.status(200).json({
@@ -267,7 +284,6 @@ mqttClient.on("message", async (topic, message) => {
   }
 });
 
-
 mqttClient.on("error", (err) => {
   console.error("❌ MQTT Error:", err);
 });
@@ -279,8 +295,6 @@ mqttClient.on("close", () => {
 mqttClient.on("reconnect", () => {
   console.log("🔄 Reconnecting to MQTT broker...");
 });
-
-
 
 // ===== PATCH USERS BY deviceId (update calculation values) =====
 app.patch("/api/users/update", async (req, res) => {
