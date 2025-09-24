@@ -213,25 +213,43 @@ function publishCommand(command) {
   });
 }
 
+app.post("/api/control-response", (req, res) => {
+  const { deviceId, code } = req.body;
+
+  if (!deviceId || !code) {
+    return res.status(400).json({ status: "error", error: "deviceId and code required" });
+  }
+
+  responseControl[deviceId] = { code };
+
+  log(`Frontend set response code for ${deviceId}: ${code}`);
+
+  res.json({
+    status: "success",
+    deviceId,
+    code,
+  });
+});
+
+
+const responseControl = {}; 
 // ===== HTTP ENDPOINT (reuses processDeviceData) =====
 app.post("/api/data", async (req, res) => {
   try {
+    const respCode = responseControl[device_id]?.code || 200;
+
     const { formatted, alertSent, alertMsg, noAlertNeeded } =
       await processDeviceData(req.body, "http");
 
     if (alertMsg) {
-      // existing FCM logic...
-
-      // 🔥 ALSO publish command to PMS/cmd
-      publishCommand({
-        deviceID: data.device_id,
-        relay1: false,
-        relay2: false,
-        GAURD1: "+919866641249", // replace with real guardian number from Firestore if needed
-        bool: true,
+      res.status(respCode).json({
+        status: "success",
+        stored: formatted,
+        alertSent,
+        noAlertNeeded,
       });
     } else {
-      res.status(200).json({
+      res.status(respCode).json({
         status: "success",
         stored: formatted,
         alertSent,
