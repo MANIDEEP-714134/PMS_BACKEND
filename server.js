@@ -217,7 +217,9 @@ app.post("/api/control-response", (req, res) => {
   const { deviceId, code } = req.body;
 
   if (!deviceId || !code) {
-    return res.status(400).json({ status: "error", error: "deviceId and code required" });
+    return res
+      .status(400)
+      .json({ status: "error", error: "deviceId and code required" });
   }
 
   responseControl[deviceId] = { code };
@@ -231,11 +233,11 @@ app.post("/api/control-response", (req, res) => {
   });
 });
 
-
-const responseControl = {}; 
+const responseControl = {};
 // ===== HTTP ENDPOINT (reuses processDeviceData) =====
 app.post("/api/data", async (req, res) => {
   try {
+    const { device_id } = req.body;
     const respCode = responseControl[device_id]?.code || 200;
 
     const { formatted, alertSent, alertMsg, noAlertNeeded } =
