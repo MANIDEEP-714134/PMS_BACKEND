@@ -238,31 +238,31 @@ const responseControl = {};
 app.post("/api/data", async (req, res) => {
   try {
     const { device_id } = req.body;
-    const respCode = responseControl[device_id]?.code || 200;
+
+    let respCode = 200;
+
+    // ✅ Use custom response code once if set
+    if (responseControl[device_id]) {
+      respCode = responseControl[device_id].code || 200;
+      delete responseControl[device_id]; // remove so it applies only once
+    }
 
     const { formatted, alertSent, alertMsg, noAlertNeeded } =
       await processDeviceData(req.body, "http");
 
-    if (alertMsg) {
-      res.status(respCode).json({
-        status: "success",
-        stored: formatted,
-        alertSent,
-        noAlertNeeded,
-      });
-    } else {
-      res.status(respCode).json({
-        status: "success",
-        stored: formatted,
-        alertSent,
-        noAlertNeeded,
-      });
-    }
+    res.status(respCode).json({
+      status: "success",
+      stored: formatted,
+      alertSent,
+      noAlertNeeded,
+      alertMsg,
+    });
   } catch (err) {
     log(`❌ Error saving HTTP data: ${err}`, "ERROR");
     res.status(500).json({ status: "error", error: err.message });
   }
 });
+
 
 // ===== MQTT HANDLER =====
 // ===== MQTT CONFIG =====
