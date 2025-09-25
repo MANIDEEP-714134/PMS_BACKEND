@@ -8,6 +8,39 @@ require("dotenv").config();
 const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
+const twilio = require("twilio");
+
+const accountSid = process.env.TWILIO_ACCOUNT_SID;;
+const authToken = process.env.TWILIO_AUTH_TOKEN
+const client = twilio(accountSid, authToken);
+
+async function makeCall(toNumber, messageUrl) {
+  try {
+    const call = await client.calls.create({
+      url: messageUrl, // TwiML Bin or XML file URL
+      to: toNumber, // Destination phone number
+      from: "+15513654561", // Your Twilio number
+    });
+    console.log("✅ Call started, SID:", call.sid);
+    return call.sid;
+  } catch (err) {
+    console.error("❌ Call failed:", err.message);
+    throw err;
+  }
+}
+
+async function makeCallsSequentially(numbers, messageUrl) {
+  for (const num of numbers) {
+    try {
+      const sid = await makeCall(num, messageUrl);
+      console.log(`📞 Call to ${num} started (SID: ${sid})`);
+      // wait a bit before next call (optional)
+      await new Promise((resolve) => setTimeout(resolve, 60000));
+    } catch (err) {
+      console.error(`❌ Failed to call ${num}:`, err.message);
+    }
+  }
+}
 
 // ===== CONFIG =====
 const PORT = 8080;
@@ -153,6 +186,10 @@ async function processDeviceData(data, source = "http") {
         active: false,
       };
       if (!deviceAlertState.active) {
+        await makeCallsSequentially(
+          ["+917661912957", "+918897618973"],
+          "https://handler.twilio.com/twiml/EH07a7a07e1fe048421184ab40a80757e4"
+        );
         for (const doc of snapshot.docs) {
           const userData = doc.data();
           if (userData.fcmToken) {
@@ -241,10 +278,10 @@ app.post("/api/data", async (req, res) => {
 
     let respCode = 200;
 
-    // ✅ Use custom response code once if set
+    // Use custom response code once if set
     if (responseControl[device_id]) {
       respCode = responseControl[device_id].code || 200;
-      delete responseControl[device_id]; // remove so it applies only once
+      delete responseControl[device_id];
     }
 
     const { formatted, alertSent, alertMsg, noAlertNeeded } =
@@ -262,7 +299,6 @@ app.post("/api/data", async (req, res) => {
     res.status(500).json({ status: "error", error: err.message });
   }
 });
-
 
 // ===== MQTT HANDLER =====
 // ===== MQTT CONFIG =====
