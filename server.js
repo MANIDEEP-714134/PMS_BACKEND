@@ -35,7 +35,7 @@ async function makeCallsSequentially(numbers, messageUrl) {
       const sid = await makeCall(num, messageUrl);
       console.log(`📞 Call to ${num} started (SID: ${sid})`);
       // wait a bit before next call (optional)
-      await new Promise((resolve) => setTimeout(resolve, 60000));
+      await new Promise((resolve) => setTimeout(resolve, 6000));
     } catch (err) {
       console.error(`❌ Failed to call ${num}:`, err.message);
     }
