@@ -10,8 +10,8 @@ const admin = require("firebase-admin");
 const cors = require("cors");
 const twilio = require("twilio");
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;;
-const authToken = process.env.TWILIO_AUTH_TOKEN
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
 const client = twilio(accountSid, authToken);
 
 async function makeCall(toNumber, messageUrl) {
@@ -45,6 +45,16 @@ async function makeCallsSequentially(numbers, messageUrl) {
 // ===== CONFIG =====
 const PORT = 8080;
 const TWO_DAYS = 2 * 24 * 60 * 60 * 1000; // 2 days in ms
+
+// ===== GLOBAL HARDCODED SENSOR VALUES =====
+const HARDCODED_SENSORS = {
+  temperature: 29.5,
+  turbidity: 15.7,
+  ph: 7.1,
+  do: 6.9,
+  tds: 260.3,
+};
+
 
 // ===== FIREBASE SETUP =====
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
@@ -81,19 +91,27 @@ const log = (msg, type = "INFO") => {
   console.log(`[${new Date().toISOString()}] [${type}] ${msg}`);
 };
 
-const formatData = (device_id, payload, firestoreTimestamp) => ({
-  device_id,
-  line1: payload.line1 ?? 0,
-  line2: payload.line2 ?? 0,
-  temperature: payload.temperature ?? 0,
-  turbidity: payload.turbidity ?? 0,
-  ph: payload.ph ?? 0,
-  do: payload.do ?? 0,
-  tds: payload.tds ?? 0,
-  relay1_status: payload.relay1_status ?? 0,
-  relay2_status: payload.relay2_status ?? 0,
-  timestamp: firestoreTimestamp || admin.firestore.Timestamp.now(),
-});
+function formatData(device_id, payload) {
+  const formatted = {
+    device_id,
+    line1: Number(payload.line1) || 0,
+    line2: Number(payload.line2) || 0,
+    relay1_status: payload.relay1_status ?? 0,
+    relay2_status: payload.relay2_status ?? 0,
+
+    // copy any other keys (optional)
+    ...payload,
+
+    // hard override these keys
+    ...HARDCODED_SENSORS,
+
+    timestamp: admin.firestore.Timestamp.now(),
+  };
+  return formatted;
+}
+
+
+
 
 // ===== IN-MEMORY CACHES =====
 const liveDataCache = {}; // { deviceId: { data, lastUpdated } }
@@ -111,130 +129,151 @@ const MQTT_BROKER = process.env.MQTT_BROKER || "mqtt://broker.emqx.io";
 const MQTT_TOPIC = process.env.MQTT_TOPIC || "PMS/data";
 const mqttClient = mqtt.connect(MQTT_BROKER);
 
-// ===== CORE PROCESSING FUNCTION =====
+// Cache to store device alert active state
+
 async function processDeviceData(data, source = "http") {
   if (!data.device_id) throw new Error("device_id required");
 
+  const deviceId = data.device_id;
   const docId = getFormattedTimestamp();
-  const formatted = formatData(data.device_id, data);
+  const formatted = formatData(deviceId, data);
 
-  // Save in Firestore
-  await firestore.collection(data.device_id).doc(docId).set(formatted);
+  // ==========================================================
+  // 1️⃣ Store data in Firestore + Update live & history caches
+  // ==========================================================
+  await firestore.collection(deviceId).doc(docId).set(formatted);
 
-  // Save in live cache
-  liveDataCache[data.device_id] = {
-    data: formatted,
-    lastUpdated: Date.now(),
-  };
-
-  // Save in history cache (2-day rolling window)
-  if (!historyCache[data.device_id]) historyCache[data.device_id] = [];
-  historyCache[data.device_id].push(formatted);
+  liveDataCache[deviceId] = { data: formatted, lastUpdated: Date.now() };
+  if (!historyCache[deviceId]) historyCache[deviceId] = [];
+  historyCache[deviceId].push(formatted);
   const cutoff = Date.now() - TWO_DAYS;
-  historyCache[data.device_id] = historyCache[data.device_id].filter(
+  historyCache[deviceId] = historyCache[deviceId].filter(
     (item) => item.timestamp.toMillis() >= cutoff
   );
+  log(`[${source.toUpperCase()}] Data stored: ${deviceId}/${docId}`);
 
-  log(`[${source.toUpperCase()}] Data stored: ${data.device_id}/${docId}`);
-
-  // ========== NOTIFICATION CHECK (same as your existing logic) ==========
-  let alertSent = false;
-  let noAlertNeeded = true;
+  // ==========================================================
+  // 2️⃣ Check alert condition
+  // ==========================================================
+  let alertTriggered = false;
   let alertMsg = "";
 
-  let deviceSettings = userSettingsCache[data.device_id];
+  // Load device settings (cached)
+  let deviceSettings = userSettingsCache[deviceId];
   if (!deviceSettings) {
-    const snapshot = await firestore
+    const settingsSnap = await firestore
       .collection("users")
-      .where("deviceId", "==", data.device_id)
+      .where("deviceId", "==", deviceId)
       .get();
 
-    if (!snapshot.empty) {
-      const firstUser = snapshot.docs[0].data();
+    if (!settingsSnap.empty) {
+      const user = settingsSnap.docs[0].data();
       deviceSettings = {
-        noAeratorsLine1: firstUser.noAeratorsLine1 || 0,
-        noAeratorsLine2: firstUser.noAeratorsLine2 || 0,
-        perAerator_currentLine1: firstUser.perAerator_currentLine1 || 1,
-        perAerator_currentLine2: firstUser.perAerator_currentLine2 || 1,
+        noAeratorsLine1: user.noAeratorsLine1 || 0,
+        noAeratorsLine2: user.noAeratorsLine2 || 0,
+        perAerator_currentLine1: user.perAerator_currentLine1 || 1,
+        perAerator_currentLine2: user.perAerator_currentLine2 || 1,
       };
-      userSettingsCache[data.device_id] = deviceSettings;
-      log(`Cached calculation values for deviceId=${data.device_id}`);
+      userSettingsCache[deviceId] = deviceSettings;
+      log(`Cached settings for deviceId=${deviceId}`);
     }
   }
 
-  if (deviceSettings) {
-    const snapshot = await firestore
+  // Skip if no settings found
+  if (!deviceSettings) return { formatted, alertTriggered, alertMsg };
+
+  // Calculate aerator ratios
+  const ratio1 = Math.round(
+    formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1)
+  );
+  const ratio2 = Math.round(
+    formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1)
+  );
+
+  // Check thresholds
+  const line1Low = ratio1 < (deviceSettings.noAeratorsLine1 || 0);
+  const line2Low = ratio2 < (deviceSettings.noAeratorsLine2 || 0);
+
+  if (line1Low && line2Low) {
+    alertMsg =
+      `Both Line 1 and Line 2 aerators are running low. ` +
+      `(Line1: ${ratio1}/${deviceSettings.noAeratorsLine1}, ` +
+      `Line2: ${ratio2}/${deviceSettings.noAeratorsLine2})`;
+  } else if (line1Low) {
+    alertMsg = `Line 1 aerators running low: ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}.`;
+  } else if (line2Low) {
+    alertMsg = `Line 2 aerators running low: ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
+  }
+
+  // ==========================================================
+  // 3️⃣ Alert handling (only once per trigger)
+  // ==========================================================
+  const currentlyAlerting = !!alertMsg;
+  const previouslyAlerting = alertStateCache[deviceId] || false;
+
+  if (currentlyAlerting && !previouslyAlerting) {
+    // ---- NEW ALERT ----
+    log(`🚨 New alert for ${deviceId}: ${alertMsg}`);
+    alertStateCache[deviceId] = true; // mark as active
+
+    // --- Get all users for this device ---
+    const usersSnap = await firestore
       .collection("users")
-      .where("deviceId", "==", data.device_id)
+      .where("deviceId", "==", deviceId)
       .get();
 
-    const ratio1 = Math.round(
-      formatted.line1 / (deviceSettings.perAerator_currentLine1 || 1)
-    );
-    const ratio2 = Math.round(
-      formatted.line2 / (deviceSettings.perAerator_currentLine2 || 1)
-    );
+    // --- Send FCM first ---
+    for (const doc of usersSnap.docs) {
+      const user = doc.data();
+      if (!user.fcmToken) continue;
 
-    if (ratio1 < (deviceSettings.noAeratorsLine1 || 0))
-      alertMsg += `Line1 aerators running = ${ratio1}, expected ≥ ${deviceSettings.noAeratorsLine1}. `;
-    if (ratio2 < (deviceSettings.noAeratorsLine2 || 0))
-      alertMsg += `Line2 aerators running = ${ratio2}, expected ≥ ${deviceSettings.noAeratorsLine2}.`;
+      const message = {
+        token: user.fcmToken,
+        notification: {
+          title: "⚠️ Aerator Alert!",
+          body: `Device ${deviceId}: ${alertMsg}`,
+        },
+        android: {
+          priority: "HIGH",
+          notification: {
+            channel_id: "alarm_channel",
+            sound: "alarm",
+          },
+        },
+      };
 
-    if (alertMsg) {
-      noAlertNeeded = false;
-      const deviceAlertState = alertStateCache[data.device_id] || {
-        active: false,
-      };
-      if (!deviceAlertState.active) {
-        await makeCallsSequentially(
-          ["+917661912957", "+918897618973"],
-          "https://handler.twilio.com/twiml/EH07a7a07e1fe048421184ab40a80757e4"
-        );
-        for (const doc of snapshot.docs) {
-          const userData = doc.data();
-          if (userData.fcmToken) {
-            const message = {
-              token: userData.fcmToken,
-              notification: {
-                title: "⚠️ Aerator Alert!",
-                body: `Device ${data.device_id}: ${alertMsg}`,
-              },
-              android: {
-                priority: "HIGH",
-                notification: {
-                  channel_id: "alarm_channel",
-                  sound: "alarm",
-                },
-              },
-            };
-            try {
-              await admin.messaging().send(message);
-              alertSent = true;
-            } catch (err) {
-              log(
-                `❌ Failed to send FCM for user ${doc.id}: ${err.message}`,
-                "WARN"
-              );
-            }
-          }
-        }
-        alertStateCache[data.device_id] = {
-          active: true,
-          lastAlert: Date.now(),
-        };
+      try {
+        await admin.messaging().send(message);
+        log(`📨 FCM sent to ${doc.id}`);
+      } catch (err) {
+        log(`❌ FCM failed for ${doc.id}: ${err.message}`, "WARN");
       }
-    } else {
-      const deviceAlertState = alertStateCache[data.device_id] || {
-        active: false,
-      };
-      if (deviceAlertState.active) {
-        log(`✅ Device ${data.device_id} recovered, clearing alert state`);
-      }
-      alertStateCache[data.device_id] = { active: false };
     }
+
+    // --- Then make Twilio calls ---
+    try {
+      await makeCallsSequentially(
+        ["+917661912957", "+918897618973"],
+        "https://handler.twilio.com/twiml/EH07a7a07e1fe048421184ab40a80757e4"
+      );
+      log(`📞 Twilio calls placed for ${deviceId}`);
+    } catch (err) {
+      log(`❌ Twilio call failed: ${err.message}`, "WARN");
+    }
+
+    alertTriggered = true;
+  } else if (!currentlyAlerting && previouslyAlerting) {
+    // ---- RECOVERY ----
+    log(`✅ Device ${deviceId} recovered — resetting alert state.`);
+    alertStateCache[deviceId] = false; // reset
+  } else if (!currentlyAlerting) {
+    log(`✅ No alert for ${deviceId}`);
   }
 
-  return { formatted, alertSent, alertMsg, noAlertNeeded };
+  // ==========================================================
+  // 4️⃣ Return status summary
+  // ==========================================================
+  return { formatted, alertTriggered, alertMsg };
 }
 
 function publishCommand(command) {
@@ -316,19 +355,14 @@ mqttClient.on("connect", () => {
 });
 
 mqttClient.on("message", async (topic, message) => {
-  console.log("📩 Incoming MQTT Message");
-  console.log("   📌 Topic:", topic);
-  console.log("   📦 Raw Payload:", message.toString());
-
   try {
     const parsed = JSON.parse(message.toString());
-    console.log("   ✅ Parsed JSON:", parsed);
 
     // 🔥 Store into Firestore + cache
     const { formatted, alertSent, alertMsg, noAlertNeeded } =
       await processDeviceData(parsed, "mqtt");
 
-    console.log("   💾 Stored to Firestore:", formatted.device_id);
+    console.log("MQTT Stored to Firestore:", formatted.device_id);
     if (alertMsg) {
       console.log("   🚨 Alert Triggered:", alertMsg);
       console.log("   📲 FCM sent?", alertSent);
